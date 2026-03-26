@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### passkey-client
+
+- Fix RP ID validation to require dot boundary ([#92](https://github.com/1Password/passkey-rs/pull/92))
+
 ## Passkey v0.5.0
 
 - Migrate project to Rust 2024 edition

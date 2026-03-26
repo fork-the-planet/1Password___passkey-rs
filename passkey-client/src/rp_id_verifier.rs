@@ -78,7 +78,7 @@ where
         let mut effective_domain = origin.domain().ok_or(WebauthnError::OriginMissingDomain)?;
 
         if let Some(rp_id) = rp_id {
-            if !effective_domain.ends_with(rp_id) {
+            if !is_registrable_suffix_of_or_equal_to(effective_domain, rp_id) {
                 effective_domain = self
                     .validate_related_origins(rp_id, effective_domain)
                     .await?;
@@ -152,7 +152,7 @@ where
 
         if let Some(rp_id) = rp_id {
             // subset from assert_web_rp_id
-            if !effective_rp_id.ends_with(rp_id) {
+            if !is_registrable_suffix_of_or_equal_to(effective_rp_id, rp_id) {
                 return Err(WebauthnError::OriginRpMissmatch);
             }
             effective_rp_id = rp_id;
@@ -180,13 +180,16 @@ where
         rp_id: &'a str,
         effective_domain: &'a str,
     ) -> Result<&'a str, WebauthnError> {
-        let Some(ref fetcher) = self.fetcher else {
-            return Err(WebauthnError::OriginRpMissmatch);
-        };
-
+        // First check whether we even have a valid RP ID before attempting
+        // to see if we have the means to fetch .well-known. This ordering is
+        // important for the error variants we expect to see.
         if let ControlFlow::Break(res) = self.assert_valid_rp_id(rp_id) {
             return res;
         }
+
+        let Some(ref fetcher) = self.fetcher else {
+            return Err(WebauthnError::OriginRpMissmatch);
+        };
 
         let well_known_url = Url::parse(&format!("https://{rp_id}/.well-known/webauthn"))
             .expect("Building well_known_url unexpectedly failed");
@@ -196,7 +199,7 @@ where
 
         if final_url
             .domain()
-            .filter(|domain| domain.ends_with(rp_id))
+            .filter(|domain| is_registrable_suffix_of_or_equal_to(domain, rp_id))
             .is_none()
         {
             return Err(WebauthnError::RedirectError);
@@ -249,6 +252,18 @@ where
 
         Ok(rp_id)
     }
+}
+
+/// Checks whether `host` is a registrable domain suffix of or is equal to `rp_id`,
+/// per <https://html.spec.whatwg.org/multipage/browsers.html#is-a-registrable-domain-suffix-of-or-is-equal-to>.
+///
+/// This requires that `host` either equals `rp_id` exactly, or ends with `".{rp_id}"`,
+/// preventing `evil-example.com` from matching `example.com`.
+fn is_registrable_suffix_of_or_equal_to(host: &str, rp_id: &str) -> bool {
+    host == rp_id
+        || host
+            .strip_suffix(rp_id)
+            .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
 /// Returns a decoded [String] if the domain name is punycode otherwise
