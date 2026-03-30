@@ -1,7 +1,10 @@
+use std::borrow::Cow;
+
 use passkey_types::webauthn::WellKnown;
 use public_suffix::DEFAULT_PROVIDER;
 use url::Url;
 
+use super::is_registrable_suffix_of_or_equal_to;
 use crate::{Fetcher, Origin, RelatedOriginResponse, RpIdVerifier, WebauthnError};
 
 pub struct TestFetcher {
@@ -155,7 +158,7 @@ async fn microsoft_sanity_check() {
         .expect_err("kolide sub domain should not match");
     assert_eq!(should_error, WebauthnError::OriginRpMissmatch);
 
-    let ms_origin = Origin::Web(std::borrow::Cow::Owned(
+    let ms_origin = Origin::Web(Cow::Owned(
         Url::parse("https://login.microsoft.com").unwrap(),
     ));
     let ms_rpid = verifier
@@ -188,4 +191,55 @@ async fn assert_invalid_rp_id_doesnt_panic() {
         .await
         .expect_err("kolide sub domain should not match");
     assert_eq!(should_error, WebauthnError::InvalidRpId);
+}
+
+#[test]
+fn suffix_match_requires_dot_boundary() {
+    // Exact match
+    assert!(is_registrable_suffix_of_or_equal_to(
+        "example.com",
+        "example.com"
+    ));
+
+    // Valid subdomain match (dot boundary)
+    assert!(is_registrable_suffix_of_or_equal_to(
+        "sub.example.com",
+        "example.com"
+    ));
+    assert!(is_registrable_suffix_of_or_equal_to(
+        "a.b.example.com",
+        "example.com"
+    ));
+
+    // Attack: domain that ends with the rp_id string but without a dot boundary
+    assert!(!is_registrable_suffix_of_or_equal_to(
+        "evil-example.com",
+        "example.com"
+    ));
+    assert!(!is_registrable_suffix_of_or_equal_to(
+        "notexample.com",
+        "example.com"
+    ));
+    assert!(!is_registrable_suffix_of_or_equal_to(
+        "fakeexample.com",
+        "example.com"
+    ));
+}
+
+#[tokio::test]
+async fn assert_domain_rejects_non_dot_boundary_rp_id() {
+    let fetcher = TestFetcher::default();
+    let verifier = RpIdVerifier::new(DEFAULT_PROVIDER, Some(fetcher));
+
+    // evil-1password.com should NOT be accepted for rp_id "1password.com"
+    let evil_origin = Origin::Web(Cow::Owned(
+        Url::parse("https://evil-1password.com").unwrap(),
+    ));
+    let result = verifier
+        .assert_domain(&evil_origin, Some("1password.com"))
+        .await;
+    assert!(
+        result.is_err(),
+        "evil-1password.com must not pass validation for rp_id 1password.com"
+    );
 }
