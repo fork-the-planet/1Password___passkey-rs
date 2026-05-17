@@ -188,7 +188,6 @@ However, depending on the context, it may be necessary for some applications to 
 
 ## Current Limitations
 
-- `Client::authenticate()` and `Client::register()` do not respect timeout values set in `CredentialRequestOptions`.
 - The `Client` always reports its [Authenticator Attachment Modality](https://www.w3.org/TR/webauthn-3/#sctn-authenticator-attachment-modality) as "Platform"
 - `Client` only supports the "internal" type of [AuthenticatorTransport](https://www.w3.org/TR/webauthn-3/#enum-transport)
 - The `Authenticator` currently only supports the ECDSA w/SHA-256 algorithm.

@@ -82,7 +82,13 @@ pub enum WebauthnError {
     ExceedsMaxLabelLimit,
     /// JSON serialization error
     SerializationError,
+    /// The operation timed out
+    TimeoutError,
 }
+
+// https://www.w3.org/TR/webauthn-3/#recommended-range-and-default-for-a-webauthn-ceremony-timeout 
+const MIN_TIMEOUT: u32 = 300000; // 300000ms (5min)
+const MAX_TIMEOUT: u32 = 600000; // 600000ms (10min)
 
 impl WebauthnError {
     /// Was the error a vendor error?
@@ -234,12 +240,13 @@ where
         } else {
             request.pub_key_cred_params
         };
-        // TODO: Handle given timeout here, If the value is not within what we consider a reasonable range
-        // override to our default
-        // let timeout = request
-        //     .timeout
-        //     .map(|t| t.clamp(MIN_TIMEOUT, MAX_TIMEOUT))
-        //     .unwrap_or(MAX_TIMEOUT);
+
+        // Build the timeout for the request, clamping to a reasonable range if the RP provided one, 
+        // or using our defaults if not.
+        let timeout = std::time::Duration::from_millis(request
+            .timeout
+            .map(|t| t.clamp(MIN_TIMEOUT, MAX_TIMEOUT))
+            .unwrap_or(MIN_TIMEOUT) as u64); // Treat MIN_TIMEOUT as default as per webauthn-3 spec
 
         let rp_id = self
             .rp_id_verifier
@@ -271,8 +278,8 @@ where
         let rk = self.map_rk(&request.authenticator_selection, &auth_info);
         let uv = request.authenticator_selection.map(|s| s.user_verification)
             != Some(UserVerificationRequirement::Discouraged);
-
-        let ctap2_response = self
+        
+        let ctap2_response = tokio::time::timeout(timeout, self
             .authenticator
             .make_credential(ctap2::make_credential::Request {
                 client_data_hash: client_data_json_hash.into(),
@@ -287,8 +294,9 @@ where
                 options: ctap2::make_credential::Options { rk, up: true, uv },
                 pin_auth: None,
                 pin_protocol: None,
-            })
+            }))
             .await
+            .map_err(|_| WebauthnError::TimeoutError)?
             .map_err(|sc| WebauthnError::AuthenticatorError(sc.into()))?;
 
         // SAFETY: this unwrap is safe because the ctap2_response was just created in make_credential()
@@ -355,12 +363,10 @@ where
         let request = request.public_key;
         let auth_info = self.authenticator().get_info().await;
 
-        // TODO: Handle given timeout here, If the value is not within what we consider a reasonable range
-        // override to our default
-        // let timeout = request
-        //     .timeout
-        //     .map(|t| t.clamp(MIN_TIMEOUT, MAX_TIMEOUT))
-        //     .unwrap_or(MAX_TIMEOUT);
+        let timeout = std::time::Duration::from_millis(request
+            .timeout
+            .map(|t| t.clamp(MIN_TIMEOUT, MAX_TIMEOUT))
+            .unwrap_or(MIN_TIMEOUT) as u64); // Treat MIN_TIMEOUT as default as per webauthn-3 spec
 
         let rp_id = self
             .rp_id_verifier
@@ -389,7 +395,7 @@ where
         let rk = false;
         let uv = request.user_verification != UserVerificationRequirement::Discouraged;
 
-        let ctap2_response = self
+        let ctap2_response = tokio::time::timeout(timeout, self
             .authenticator
             .get_assertion(ctap2::get_assertion::Request {
                 rp_id: rp_id.to_owned(),
@@ -399,8 +405,9 @@ where
                 options: ctap2::get_assertion::Options { rk, up: true, uv },
                 pin_auth: None,
                 pin_protocol: None,
-            })
+            }))
             .await
+            .map_err(|_| WebauthnError::TimeoutError)?
             .map_err(Into::<WebauthnError>::into)?;
 
         let client_extension_results =
