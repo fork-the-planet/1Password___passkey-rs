@@ -86,10 +86,9 @@ pub enum WebauthnError {
     TimeoutError,
 }
 
-
 // Library sets tokio import as optional, timeouts rely on it
 // Not sure if tokio should still be optional but guarding for now to avoid breaking changes
-// https://www.w3.org/TR/webauthn-3/#recommended-range-and-default-for-a-webauthn-ceremony-timeout 
+// https://www.w3.org/TR/webauthn-3/#recommended-range-and-default-for-a-webauthn-ceremony-timeout
 #[cfg(feature = "tokio")]
 const MIN_TIMEOUT: u32 = 300_000;
 #[cfg(feature = "tokio")]
@@ -249,10 +248,13 @@ where
         // Build the timeout for the request, clamping to a reasonable range if the RP provided one,
         // or using our defaults if not.
         #[cfg(feature = "tokio")]
-        let timeout = std::time::Duration::from_millis(request
-            .timeout
-            .map(|t| t.clamp(MIN_TIMEOUT, MAX_TIMEOUT))
-            .unwrap_or(MIN_TIMEOUT) as u64); // Treat MIN_TIMEOUT as default as per webauthn-3 spec
+        let timeout = std::time::Duration::from_millis(
+            request
+                .timeout
+                .map(|t| t.clamp(MIN_TIMEOUT, MAX_TIMEOUT))
+                .unwrap_or(MIN_TIMEOUT)
+                .into(),
+        ); // Treat MIN_TIMEOUT as default as per webauthn-3 spec
 
         let rp_id = self
             .rp_id_verifier
@@ -284,7 +286,7 @@ where
         let rk = self.map_rk(&request.authenticator_selection, &auth_info);
         let uv = request.authenticator_selection.map(|s| s.user_verification)
             != Some(UserVerificationRequirement::Discouraged);
-        
+
         let make_credential_request = ctap2::make_credential::Request {
             client_data_hash: client_data_json_hash.into(),
             rp: ctap2::make_credential::PublicKeyCredentialRpEntity {
@@ -301,13 +303,18 @@ where
         };
 
         #[cfg(feature = "tokio")]
-        let ctap2_response = tokio::time::timeout(timeout, self.authenticator.make_credential(make_credential_request))
-            .await
-            .map_err(|_| WebauthnError::TimeoutError)?
-            .map_err(|sc| WebauthnError::AuthenticatorError(sc.into()))?;
+        let ctap2_response = tokio::time::timeout(
+            timeout,
+            self.authenticator.make_credential(make_credential_request),
+        )
+        .await
+        .map_err(|_| WebauthnError::TimeoutError)?
+        .map_err(|sc| WebauthnError::AuthenticatorError(sc.into()))?;
 
         #[cfg(not(feature = "tokio"))]
-        let ctap2_response = self.authenticator.make_credential(make_credential_request)
+        let ctap2_response = self
+            .authenticator
+            .make_credential(make_credential_request)
             .await
             .map_err(|sc| WebauthnError::AuthenticatorError(sc.into()))?;
 
@@ -376,10 +383,13 @@ where
         let auth_info = self.authenticator().get_info().await;
 
         #[cfg(feature = "tokio")]
-        let timeout = std::time::Duration::from_millis(request
-            .timeout
-            .map(|t| t.clamp(MIN_TIMEOUT, MAX_TIMEOUT))
-            .unwrap_or(MIN_TIMEOUT) as u64); // Treat MIN_TIMEOUT as default as per webauthn-3 spec
+        let timeout = std::time::Duration::from_millis(
+            request
+                .timeout
+                .map(|t| t.clamp(MIN_TIMEOUT, MAX_TIMEOUT))
+                .unwrap_or(MIN_TIMEOUT)
+                .into(),
+        ); // Treat MIN_TIMEOUT as default as per webauthn-3 spec
 
         let rp_id = self
             .rp_id_verifier
@@ -419,13 +429,18 @@ where
         };
 
         #[cfg(feature = "tokio")]
-        let ctap2_response = tokio::time::timeout(timeout, self.authenticator.get_assertion(get_assertion_request))
-            .await
-            .map_err(|_| WebauthnError::TimeoutError)?
-            .map_err(Into::<WebauthnError>::into)?;
+        let ctap2_response = tokio::time::timeout(
+            timeout,
+            self.authenticator.get_assertion(get_assertion_request),
+        )
+        .await
+        .map_err(|_| WebauthnError::TimeoutError)?
+        .map_err(Into::<WebauthnError>::into)?;
 
         #[cfg(not(feature = "tokio"))]
-        let ctap2_response = self.authenticator.get_assertion(get_assertion_request)
+        let ctap2_response = self
+            .authenticator
+            .get_assertion(get_assertion_request)
             .await
             .map_err(Into::<WebauthnError>::into)?;
 
