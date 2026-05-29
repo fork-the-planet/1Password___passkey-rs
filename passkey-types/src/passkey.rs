@@ -221,7 +221,7 @@ impl Debug for Passkey {
 }
 
 /// Supported extensions on a [`Passkey`]
-#[derive(Default, Clone, Zeroize, ZeroizeOnDrop)]
+#[derive(Debug, Default, Clone, Zeroize, ZeroizeOnDrop)]
 #[cfg_attr(any(test, feature = "testable"), derive(PartialEq))]
 pub struct CredentialExtensions {
     /// Whether the passkey has hmac-secret credentials associated to it
