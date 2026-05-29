@@ -85,4 +85,3 @@ async fn ensure_attestation_object_compatibility() {
         .expect("ensure our public key parses correctly");
     assert!(!public_key.is_empty());
 }
-
