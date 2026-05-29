@@ -33,6 +33,9 @@ jobs:
           toolchain: ${{ matrix.rust }}
           components: clippy
 
+      - name: Install libudev
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev
+
       - name: Run Clippy
         run: rustup run ${{ matrix.rust }} cargo clippy --all --all-targets --all-features -- -D warnings
 
@@ -118,6 +121,9 @@ jobs:
         with:
           profile: minimal
           toolchain: ${{ matrix.rust }}
+
+      - name: Install libudev
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev
 
       - name: Run tests
         run: rustup run ${{ matrix.rust }} cargo test
