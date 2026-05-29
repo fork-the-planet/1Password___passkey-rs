@@ -31,10 +31,15 @@ rand = "0.8"
 tokio = { version = "1", features = ["sync"], optional = true }
 
 [dev-dependencies]
+authenticator = { version = "0.4", default-features = false, features = [
+  "crypto_dummy",
+] }
+ciborium = "0.2"
 generic-array = { version = "=0.14.7", default-features = false }
 mockall = { version = "0.11" }
 passkey-types = { path = "../passkey-types", version = "0.5", features = [
   "testable",
 ] }
+serde_cbor = "0.11"
 signature = { version = "2", features = ["rand_core"] }
 tokio = { version = "1", features = ["macros", "rt", "sync"] }

@@ -171,6 +171,8 @@ where
 {
     authenticator: Authenticator<S, U>,
     rp_id_verifier: RpIdVerifier<P, F>,
+    /// When the RP sends [`UserVerificationRequirement::Preferred`], whether to set CTAP `uv` to true.
+    uv_when_preferred: bool,
 }
 
 impl<S, U> Client<S, U, public_suffix::PublicSuffixList, ()>
@@ -185,6 +187,7 @@ where
         Self {
             authenticator,
             rp_id_verifier: RpIdVerifier::new(public_suffix::DEFAULT_PROVIDER, None),
+            uv_when_preferred: true,
         }
     }
 }
@@ -206,6 +209,7 @@ where
         Self {
             authenticator,
             rp_id_verifier: RpIdVerifier::new(custom_provider, fetcher),
+            uv_when_preferred: true,
         }
     }
 
@@ -223,6 +227,13 @@ where
     /// Write access to the Client's `Authenticator`.
     pub fn authenticator_mut(&mut self) -> &mut Authenticator<S, U> {
         &mut self.authenticator
+    }
+
+    /// Set the client's preferred user verification setting.
+    /// This setting is used when the RP requirement is [`UserVerificationRequirement::Preferred`] to determine if uv should be set to true.
+    pub fn user_verification_when_preferred(mut self, enabled: bool) -> Self {
+        self.uv_when_preferred = enabled;
+        self
     }
 
     /// Register a webauthn `request` from the given `origin`.
@@ -285,8 +296,12 @@ where
         )?;
 
         let rk = self.map_rk(&request.authenticator_selection, &auth_info);
-        let uv = request.authenticator_selection.map(|s| s.user_verification)
-            != Some(UserVerificationRequirement::Discouraged);
+        let uv_requirement = request
+            .authenticator_selection
+            .as_ref()
+            .map(|s| s.user_verification)
+            .unwrap_or_default();
+        let uv = self.ctap_uv_option(uv_requirement);
 
         let make_credential_request = ctap2::make_credential::Request {
             client_data_hash: client_data_json_hash.into(),
@@ -417,7 +432,7 @@ where
             auth_info.extensions.unwrap_or_default().as_slice(),
         )?;
         let rk = false;
-        let uv = request.user_verification != UserVerificationRequirement::Discouraged;
+        let uv = self.ctap_uv_option(request.user_verification);
 
         let get_assertion_request = ctap2::get_assertion::Request {
             rp_id: rp_id.to_owned(),
@@ -509,6 +524,16 @@ where
                 ..
             // > Let requireResidentKey be the value of pkOptions.authenticatorSelection.requireResidentKey.
             } => *require_resident_key,
+        }
+    }
+
+    /// Determine if user verification is required based on the given requirement and the client's preferred user verification setting.
+    /// If the requirement is [`UserVerificationRequirement::Preferred`], use the client's preferred user verification setting.
+    fn ctap_uv_option(&self, requirement: UserVerificationRequirement) -> bool {
+        match requirement {
+            UserVerificationRequirement::Discouraged => false,
+            UserVerificationRequirement::Required => true,
+            UserVerificationRequirement::Preferred => self.uv_when_preferred,
         }
     }
 }
