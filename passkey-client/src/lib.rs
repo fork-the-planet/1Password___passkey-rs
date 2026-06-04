@@ -48,6 +48,7 @@ mod tests;
 #[cfg_attr(feature = "typeshare", typeshare)]
 #[derive(Debug, serde::Serialize, PartialEq, Eq)]
 #[serde(tag = "type", content = "content")]
+#[non_exhaustive]
 /// Errors produced by Webauthn Operations.
 pub enum WebauthnError {
     /// A credential ID can be a maximum of 1023 bytes.
@@ -82,7 +83,17 @@ pub enum WebauthnError {
     ExceedsMaxLabelLimit,
     /// JSON serialization error
     SerializationError,
+    /// The operation timed out
+    TimeoutError,
 }
+
+// Library sets tokio import as optional, timeouts rely on it
+// Not sure if tokio should still be optional but guarding for now to avoid breaking changes
+// https://www.w3.org/TR/webauthn-3/#recommended-range-and-default-for-a-webauthn-ceremony-timeout
+#[cfg(feature = "tokio")]
+const MIN_TIMEOUT: u32 = 300_000;
+#[cfg(feature = "tokio")]
+const MAX_TIMEOUT: u32 = 600_000;
 
 impl WebauthnError {
     /// Was the error a vendor error?
@@ -245,12 +256,17 @@ where
         } else {
             request.pub_key_cred_params
         };
-        // TODO: Handle given timeout here, If the value is not within what we consider a reasonable range
-        // override to our default
-        // let timeout = request
-        //     .timeout
-        //     .map(|t| t.clamp(MIN_TIMEOUT, MAX_TIMEOUT))
-        //     .unwrap_or(MAX_TIMEOUT);
+
+        // Build the timeout for the request, clamping to a reasonable range if the RP provided one,
+        // or using our defaults if not.
+        #[cfg(feature = "tokio")]
+        let timeout = std::time::Duration::from_millis(
+            request
+                .timeout
+                .map(|t| t.clamp(MIN_TIMEOUT, MAX_TIMEOUT))
+                .unwrap_or(MIN_TIMEOUT)
+                .into(),
+        ); // Treat MIN_TIMEOUT as default as per webauthn-3 spec
 
         let rp_id = self
             .rp_id_verifier
@@ -287,22 +303,34 @@ where
             .unwrap_or_default();
         let uv = self.ctap_uv_option(uv_requirement);
 
+        let make_credential_request = ctap2::make_credential::Request {
+            client_data_hash: client_data_json_hash.into(),
+            rp: ctap2::make_credential::PublicKeyCredentialRpEntity {
+                id: rp_id.to_owned(),
+                name: Some(request.rp.name),
+            },
+            user: request.user,
+            pub_key_cred_params,
+            exclude_list: request.exclude_credentials,
+            extensions: ctap_extensions,
+            options: ctap2::make_credential::Options { rk, up: true, uv },
+            pin_auth: None,
+            pin_protocol: None,
+        };
+
+        #[cfg(feature = "tokio")]
+        let ctap2_response = tokio::time::timeout(
+            timeout,
+            self.authenticator.make_credential(make_credential_request),
+        )
+        .await
+        .map_err(|_| WebauthnError::TimeoutError)?
+        .map_err(|sc| WebauthnError::AuthenticatorError(sc.into()))?;
+
+        #[cfg(not(feature = "tokio"))]
         let ctap2_response = self
             .authenticator
-            .make_credential(ctap2::make_credential::Request {
-                client_data_hash: client_data_json_hash.into(),
-                rp: ctap2::make_credential::PublicKeyCredentialRpEntity {
-                    id: rp_id.to_owned(),
-                    name: Some(request.rp.name),
-                },
-                user: request.user,
-                pub_key_cred_params,
-                exclude_list: request.exclude_credentials,
-                extensions: ctap_extensions,
-                options: ctap2::make_credential::Options { rk, up: true, uv },
-                pin_auth: None,
-                pin_protocol: None,
-            })
+            .make_credential(make_credential_request)
             .await
             .map_err(|sc| WebauthnError::AuthenticatorError(sc.into()))?;
 
@@ -370,12 +398,14 @@ where
         let request = request.public_key;
         let auth_info = self.authenticator().get_info().await;
 
-        // TODO: Handle given timeout here, If the value is not within what we consider a reasonable range
-        // override to our default
-        // let timeout = request
-        //     .timeout
-        //     .map(|t| t.clamp(MIN_TIMEOUT, MAX_TIMEOUT))
-        //     .unwrap_or(MAX_TIMEOUT);
+        #[cfg(feature = "tokio")]
+        let timeout = std::time::Duration::from_millis(
+            request
+                .timeout
+                .map(|t| t.clamp(MIN_TIMEOUT, MAX_TIMEOUT))
+                .unwrap_or(MIN_TIMEOUT)
+                .into(),
+        ); // Treat MIN_TIMEOUT as default as per webauthn-3 spec
 
         let rp_id = self
             .rp_id_verifier
@@ -404,17 +434,29 @@ where
         let rk = false;
         let uv = self.ctap_uv_option(request.user_verification);
 
+        let get_assertion_request = ctap2::get_assertion::Request {
+            rp_id: rp_id.to_owned(),
+            client_data_hash: client_data_json_hash.into(),
+            allow_list: request.allow_credentials,
+            extensions: ctap_extensions,
+            options: ctap2::get_assertion::Options { rk, up: true, uv },
+            pin_auth: None,
+            pin_protocol: None,
+        };
+
+        #[cfg(feature = "tokio")]
+        let ctap2_response = tokio::time::timeout(
+            timeout,
+            self.authenticator.get_assertion(get_assertion_request),
+        )
+        .await
+        .map_err(|_| WebauthnError::TimeoutError)?
+        .map_err(Into::<WebauthnError>::into)?;
+
+        #[cfg(not(feature = "tokio"))]
         let ctap2_response = self
             .authenticator
-            .get_assertion(ctap2::get_assertion::Request {
-                rp_id: rp_id.to_owned(),
-                client_data_hash: client_data_json_hash.into(),
-                allow_list: request.allow_credentials,
-                extensions: ctap_extensions,
-                options: ctap2::get_assertion::Options { rk, up: true, uv },
-                pin_auth: None,
-                pin_protocol: None,
-            })
+            .get_assertion(get_assertion_request)
             .await
             .map_err(Into::<WebauthnError>::into)?;
 
