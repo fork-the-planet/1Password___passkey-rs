@@ -121,7 +121,7 @@ impl Command {
     }
 }
 /// a CTAP2 HID packet can be at most 64 bytes, bigger messages are broken up using Continuation Packets
-const MAX_PACKET_SIZE: usize = 64;
+pub const MAX_PACKET_SIZE: usize = 64;
 
 /// Initialization Packet header
 ///
@@ -275,14 +275,6 @@ impl PacketHeader {
             }
         }
     }
-
-    /// Get the length of the header size
-    const fn len(&self) -> usize {
-        match self {
-            PacketHeader::Initialization(_) => InitHeader::HEADER_SIZE,
-            PacketHeader::Continuation(_) => ContHeader::HEADER_SIZE,
-        }
-    }
 }
 
 /// A complete CTAP2 message, which is built from one or many packets.
@@ -343,21 +335,28 @@ impl Message {
 
     /// Send a message to the client by breaking it up into CTAP2 HID packets and sending them in sequence.
     pub fn send<W: std::io::Write>(self, writer: &mut W) -> Result<(), std::io::Error> {
-        let packets = self.to_packets();
-        let mut buf = [0; MAX_PACKET_SIZE];
-        let num_packets = packets.len() - 1;
-        for (i, (header, data)) in packets.into_iter().enumerate() {
-            // if last packet zero bytes that will not be written to
-            if i == num_packets {
-                let data_len = header.len() + data.len();
-                buf[data_len..].iter_mut().for_each(|b| *b = 0);
-            }
-            header.encode(data, &mut buf);
-
+        for buf in self.encode_packets() {
             let _ = writer.write(&buf)?;
             writer.flush()?;
         }
         Ok(())
+    }
+
+    /// Encode this message as a sequence of fully-padded 64-byte CTAPHID packets.
+    ///
+    /// Each returned packet is exactly [`MAX_PACKET_SIZE`] bytes and ready to be written to
+    /// the transport. Use this when you need to drive the wire encoding yourself (for example
+    /// from an async writer that cannot use [`Message::send`]).
+    pub fn encode_packets(&self) -> Vec<[u8; MAX_PACKET_SIZE]> {
+        let packets = self.to_packets();
+        packets
+            .into_iter()
+            .map(|(header, data)| {
+                let mut buf = [0u8; MAX_PACKET_SIZE];
+                header.encode(data, &mut buf);
+                buf
+            })
+            .collect()
     }
 
     /// Break up a [Message] into packets which are a tuple of the packet's header and its associated

@@ -16,6 +16,18 @@ version = "0.1.0"
 [lints]
 workspace = true
 
+[features]
+default = []
+linux = []
+
 [dependencies]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+nix = { version = "0.29", features = ["fs", "ioctl"] }
+tokio = { version = "1", features = ["net", "rt", "sync", "macros", "time"] }
+udev = "0.9"
+hidparser = "1.0"
+rand = { version = "0.10", features = ["chacha"] }
 
 [dev-dependencies]
