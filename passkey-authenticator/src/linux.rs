@@ -19,12 +19,11 @@ use std::io;
 use std::path::Path;
 
 use passkey_transports::hid::{Command, Message};
-use passkey_transports::hidraw::{
-    DeviceInfo, HidrawError, HidDevice, enumerate_fido_devices,
-};
+use passkey_transports::hidraw::{DeviceInfo, HidDevice, HidrawError, enumerate_fido_devices};
 use passkey_types::ctap2::{
     Ctap2Error, StatusCode, U2FError, get_assertion, get_info, make_credential,
 };
+use tokio::sync::Mutex;
 
 use crate::Ctap2Api;
 
@@ -102,6 +101,9 @@ pub struct LinuxAuthenticator {
     /// `Response` values cheaply, and avoids requiring `Clone` on the response
     /// type, which lives in `passkey-types`.
     get_info_cbor: Vec<u8>,
+    /// A caller performing a multi-packet CBOR transaction on this device must acquire this lock so
+    /// concurrent callers don't interleave packets on the wire.
+    txn_lock: Mutex<()>,
 }
 
 impl LinuxAuthenticator {
@@ -131,12 +133,92 @@ impl LinuxAuthenticator {
             channel: init.channel,
             capabilities: init.capabilities,
             get_info_cbor: raw,
+            txn_lock: Mutex::new(()),
         })
     }
 
     /// Capabilities reported by the device in its `CTAPHID_INIT` response.
     pub fn capabilities(&self) -> Capabilities {
         self.capabilities
+    }
+
+    /// Issue `authenticatorMakeCredential` against the device. Holds an internal mutex for the
+    /// duration of the transaction to keep wire packets in order.
+    pub async fn make_credential(
+        &self,
+        request: make_credential::Request,
+    ) -> Result<make_credential::Response, StatusCode> {
+        let mut body = Vec::new();
+        ciborium::ser::into_writer(&request, &mut body)
+            .map_err(|_| StatusCode::from(U2FError::Other))?;
+        let _guard = self.txn_lock.lock().await;
+        let response = send_cbor(&self.device, self.channel, CTAP_CMD_MAKE_CREDENTIAL, &body)
+            .await
+            .map_err(StatusCode::from)?;
+        ciborium::de::from_reader(response.as_slice())
+            .map_err(|_| StatusCode::from(Ctap2Error::InvalidCbor))
+    }
+
+    /// Issue `authenticatorGetAssertion` against the device. See [`Self::make_credential`].
+    pub async fn get_assertion(
+        &self,
+        request: get_assertion::Request,
+    ) -> Result<get_assertion::Response, StatusCode> {
+        let mut body = Vec::new();
+        ciborium::ser::into_writer(&request, &mut body)
+            .map_err(|_| StatusCode::from(U2FError::Other))?;
+        let _guard = self.txn_lock.lock().await;
+        let response = send_cbor(&self.device, self.channel, CTAP_CMD_GET_ASSERTION, &body)
+            .await
+            .map_err(StatusCode::from)?;
+        ciborium::de::from_reader(response.as_slice())
+            .map_err(|_| StatusCode::from(Ctap2Error::InvalidCbor))
+    }
+
+    /// Send `CTAPHID_CANCEL` on this authenticator's channel without taking the
+    /// transaction mutex.
+    ///
+    /// This causes any in-flight `CTAPHID_CBOR` request on the same channel to be aborted; the
+    /// awaiting `make_credential` / `get_assertion` future will return
+    /// `Ctap2Error::KeepAliveCancel`. Calling this on a channel with no in-flight request is a
+    /// no-op (the device ignores it).
+    pub async fn cancel(&self) -> Result<(), HidrawError> {
+        let msg = Message::new(self.channel, Command::Cancel, &[])
+            .map_err(|_| HidrawError::MessageTooLarge)?;
+        self.device.send(&msg).await
+    }
+
+    /// Read and decode the cached `authenticatorGetInfo` response.
+    pub fn info(&self) -> get_info::Response {
+        ciborium::de::from_reader(self.get_info_cbor.as_slice()).unwrap_or_default()
+    }
+}
+
+/// Internal error type for CBOR transactions. Maps cleanly to both [`StatusCode`]
+/// (for the [`Ctap2Api`] surface) and [`OpenError`] (for the constructor).
+#[derive(Debug)]
+enum TransactionError {
+    Hid(HidrawError),
+    Status(StatusCode),
+}
+
+impl From<TransactionError> for OpenError {
+    fn from(e: TransactionError) -> Self {
+        match e {
+            TransactionError::Hid(e) => OpenError::Transport(e),
+            TransactionError::Status(s) => OpenError::GetInfo(s),
+        }
+    }
+}
+
+impl From<TransactionError> for StatusCode {
+    fn from(e: TransactionError) -> Self {
+        match e {
+            TransactionError::Status(s) => s,
+            // CTAP doesn't have a dedicated "transport failed" status code; surface
+            // it as the catch-all CTAP1 `U2FError::Other` (0x7F).
+            TransactionError::Hid(_) => StatusCode::from(U2FError::Other),
+        }
     }
 }
 
@@ -177,69 +259,23 @@ async fn send_cbor(
     Ok(bytes)
 }
 
-/// Internal error type for CBOR transactions. Maps cleanly to both [`StatusCode`]
-/// (for the [`Ctap2Api`] surface) and [`OpenError`] (for the constructor).
-#[derive(Debug)]
-enum TransactionError {
-    Hid(HidrawError),
-    Status(StatusCode),
-}
-
-impl From<TransactionError> for OpenError {
-    fn from(e: TransactionError) -> Self {
-        match e {
-            TransactionError::Hid(e) => OpenError::Transport(e),
-            TransactionError::Status(s) => OpenError::GetInfo(s),
-        }
-    }
-}
-
-impl From<TransactionError> for StatusCode {
-    fn from(e: TransactionError) -> Self {
-        match e {
-            TransactionError::Status(s) => s,
-            // CTAP doesn't have a dedicated "transport failed" status code; surface
-            // it as the catch-all CTAP1 `U2FError::Other` (0x7F).
-            TransactionError::Hid(_) => StatusCode::from(U2FError::Other),
-        }
-    }
-}
-
 #[async_trait::async_trait]
 impl Ctap2Api for LinuxAuthenticator {
     async fn get_info(&self) -> Box<get_info::Response> {
-        // We validated that `self.get_info_cbor` parses into a `Response` during the construction
-        // of LinuxAuthenticator, so this should not fail.
-        let parsed: get_info::Response =
-            ciborium::de::from_reader(self.get_info_cbor.as_slice()).unwrap_or_default();
-        Box::new(parsed)
+        Box::new(self.info())
     }
 
     async fn make_credential(
         &mut self,
         request: make_credential::Request,
     ) -> Result<make_credential::Response, StatusCode> {
-        let mut body = Vec::new();
-        ciborium::ser::into_writer(&request, &mut body)
-            .map_err(|_| StatusCode::from(U2FError::Other))?;
-        let response = send_cbor(&self.device, self.channel, CTAP_CMD_MAKE_CREDENTIAL, &body)
-            .await
-            .map_err(StatusCode::from)?;
-        ciborium::de::from_reader(response.as_slice())
-            .map_err(|_| StatusCode::from(Ctap2Error::InvalidCbor))
+        LinuxAuthenticator::make_credential(self, request).await
     }
 
     async fn get_assertion(
         &mut self,
         request: get_assertion::Request,
     ) -> Result<get_assertion::Response, StatusCode> {
-        let mut body = Vec::new();
-        ciborium::ser::into_writer(&request, &mut body)
-            .map_err(|_| StatusCode::from(U2FError::Other))?;
-        let response = send_cbor(&self.device, self.channel, CTAP_CMD_GET_ASSERTION, &body)
-            .await
-            .map_err(StatusCode::from)?;
-        ciborium::de::from_reader(response.as_slice())
-            .map_err(|_| StatusCode::from(Ctap2Error::InvalidCbor))
+        LinuxAuthenticator::get_assertion(self, request).await
     }
 }

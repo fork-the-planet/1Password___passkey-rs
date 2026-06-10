@@ -37,6 +37,9 @@ use url::Url;
 mod extensions;
 mod rp_id_verifier;
 
+#[cfg(all(feature = "linux", target_os = "linux"))]
+pub mod linux;
+
 pub use self::rp_id_verifier::{Fetcher, RelatedOriginResponse, RpIdVerifier};
 
 #[cfg(feature = "android-asset-validation")]
