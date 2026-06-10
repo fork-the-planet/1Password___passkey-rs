@@ -31,7 +31,10 @@ async fn client_setup(
             pub_key_cred_params: vec![parameters_from_rp],
             timeout: None,
             exclude_credentials: None,
-            authenticator_selection: None,
+            authenticator_selection: Some(AuthenticatorSelectionCriteria {
+                resident_key: Some(ResidentKeyRequirement::Required),
+                ..Default::default()
+            }),
             hints: None,
             attestation: AttestationConveyancePreference::None,
             attestation_formats: None,
