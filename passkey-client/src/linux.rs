@@ -279,7 +279,6 @@ where
                 allow_list: opts.allow_credentials.clone(),
                 extensions: None,
                 options: ctap2::get_assertion::Options {
-                    rk: false,
                     up: true,
                     uv,
                 },

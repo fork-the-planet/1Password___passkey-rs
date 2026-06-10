@@ -434,7 +434,6 @@ where
             &request,
             auth_info.extensions.unwrap_or_default().as_slice(),
         )?;
-        let rk = false;
         let uv = self.ctap_uv_option(request.user_verification);
 
         let get_assertion_request = ctap2::get_assertion::Request {
@@ -442,7 +441,7 @@ where
             client_data_hash: client_data_json_hash.into(),
             allow_list: request.allow_credentials,
             extensions: ctap_extensions,
-            options: ctap2::get_assertion::Options { rk, up: true, uv },
+            options: ctap2::get_assertion::Options { up: true, uv },
             pin_auth: None,
             pin_protocol: None,
         };

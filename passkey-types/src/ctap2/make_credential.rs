@@ -185,14 +185,17 @@ impl TryFrom<webauthn::PublicKeyCredentialRpEntity> for PublicKeyCredentialRpEnt
     }
 }
 
-/// The options that control how an authenticator will behave.
+/// The options that control how an authenticator will behave during authenticatorMakeCredential.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Options {
     /// Specifies whether this credential is to be discoverable or not.
     #[serde(default)]
     pub rk: bool,
     /// Instructs the authenticator to require a gesture that verifies the user to complete the request. Examples of such gestures are fingerprint scan or a PIN.
-    #[serde(default = "default_true")]
+    /// This is marked with `skip_serializing` because CTAP 2.0 does not specify a `up` field in
+    /// `Options`, while CTAP 2.1 allows the `up` field to be present but requires that its value
+    /// be set to true if it is present.
+    #[serde(default = "default_true", skip_serializing)]
     pub up: bool,
     /// User Verification:
     ///

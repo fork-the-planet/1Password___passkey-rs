@@ -38,7 +38,6 @@ fn good_request() -> Request {
         options: Options {
             up: true,
             uv: true,
-            rk: false,
         },
     }
 }
