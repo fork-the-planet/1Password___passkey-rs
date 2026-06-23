@@ -25,7 +25,8 @@ use coset::{Algorithm, iana::EnumI64};
 use passkey_authenticator::linux::{LinuxAuthenticator, OpenError};
 use passkey_authenticator::public_key_der_from_cose_key;
 use passkey_types::{
-    crypto::sha256, ctap2, encoding,
+    crypto::sha256,
+    ctap2, encoding,
     webauthn::{
         self, AuthenticatedPublicKeyCredential, AuthenticatorAssertionResponse,
         AuthenticatorAttachment, AuthenticatorAttestationResponse, ClientDataType,
@@ -203,7 +204,7 @@ where
             .auth_data
             .attested_credential_data
             .as_ref()
-            .ok_or_else(|| WebauthnError::AuthenticatorError(0x7F))?;
+            .ok_or(WebauthnError::AuthenticatorError(0x7F))?;
         let alg = match credential_id.key.alg.as_ref() {
             Some(Algorithm::PrivateUse(val)) => *val,
             Some(Algorithm::Assigned(a)) => EnumI64::to_i64(a),
@@ -278,10 +279,7 @@ where
                 client_data_hash: client_data_hash.clone().into(),
                 allow_list: opts.allow_credentials.clone(),
                 extensions: None,
-                options: ctap2::get_assertion::Options {
-                    up: true,
-                    uv,
-                },
+                options: ctap2::get_assertion::Options { up: true, uv },
                 pin_auth: None,
                 pin_protocol: None,
             };
@@ -326,10 +324,7 @@ where
 /// Whether the given `get_info::Response` indicates that the device supports a user verification
 /// method that's already configured.
 fn device_supports_uv(info: &ctap2::get_info::Response) -> bool {
-    info.options
-        .as_ref()
-        .and_then(|o| o.uv)
-        .unwrap_or(false)
+    info.options.as_ref().and_then(|o| o.uv).unwrap_or(false)
 }
 
 /// Copy of `Client::map_rk`.
@@ -384,10 +379,8 @@ async fn race_make_credential(
     candidates: Vec<(Arc<LinuxAuthenticator>, ctap2::make_credential::Request)>,
 ) -> Result<ctap2::make_credential::Response, WebauthnError> {
     let (tx, mut rx) = mpsc::channel(candidates.len().max(1));
-    let auths: Vec<Arc<LinuxAuthenticator>> = candidates
-        .iter()
-        .map(|(a, _)| Arc::clone(a))
-        .collect();
+    let auths: Vec<Arc<LinuxAuthenticator>> =
+        candidates.iter().map(|(a, _)| Arc::clone(a)).collect();
 
     for (idx, (auth, request)) in candidates.into_iter().enumerate() {
         let tx = tx.clone();
@@ -425,10 +418,8 @@ async fn race_get_assertion(
     candidates: Vec<(Arc<LinuxAuthenticator>, ctap2::get_assertion::Request)>,
 ) -> Result<ctap2::get_assertion::Response, WebauthnError> {
     let (tx, mut rx) = mpsc::channel(candidates.len().max(1));
-    let auths: Vec<Arc<LinuxAuthenticator>> = candidates
-        .iter()
-        .map(|(a, _)| Arc::clone(a))
-        .collect();
+    let auths: Vec<Arc<LinuxAuthenticator>> =
+        candidates.iter().map(|(a, _)| Arc::clone(a)).collect();
 
     for (idx, (auth, request)) in candidates.into_iter().enumerate() {
         let tx = tx.clone();

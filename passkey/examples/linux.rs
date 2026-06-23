@@ -1,6 +1,6 @@
 //! Sample App for Linux Client
 use passkey::{
-    client::{linux::LinuxClient, WebauthnError},
+    client::{WebauthnError, linux::LinuxClient},
     types::{Bytes, rand::random_vec, webauthn::*},
 };
 
@@ -16,7 +16,10 @@ async fn client_setup(
     user_entity: PublicKeyCredentialUserEntity,
 ) -> Result<(CreatedPublicKeyCredential, AuthenticatedPublicKeyCredential), WebauthnError> {
     // Create the Client
-    let my_client = LinuxClient::open_all().await.unwrap().user_verification_when_preferred(false);
+    let my_client = LinuxClient::open_all()
+        .await
+        .unwrap()
+        .user_verification_when_preferred(false);
 
     // The following values, provided as parameters to this function would usually be
     // retrieved from a Relying Party according to the context of the application.
