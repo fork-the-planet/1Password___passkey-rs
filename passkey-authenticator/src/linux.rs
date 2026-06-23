@@ -1,7 +1,7 @@
 //! Linux USB security key authenticator.
 //!
 //! [`LinuxAuthenticator`] adapts the CTAPHID transport in
-//! [`passkey_transports::hidraw`] to the [`Ctap2Api`](crate::Ctap2Api) trait, so a
+//! [`passkey_transports::hidraw`] to the [`Ctap2Api`] trait, so a
 //! USB hardware key can be plugged into anything that today drives the in-process
 //! [`Authenticator`](crate::Authenticator).
 //!

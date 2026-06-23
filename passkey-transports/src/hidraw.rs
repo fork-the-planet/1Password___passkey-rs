@@ -2,11 +2,11 @@
 //!
 //! This module enumerates FIDO-capable HID devices via `udev`, then exposes an async wrapper around
 //! `/dev/hidrawN` built on `tokio::io::unix::AsyncFd`. The wrapper handles framing CTAPHID
-//! [`Message`]s into 64-byte packets, and provides a convenience method for performing a fresh
+//! [`crate::hid::Message`]s into 64-byte packets, and provides a convenience method for performing a fresh
 //! `CTAPHID_INIT` handshake.
 //!
-//! Callers are expected to drive the CTAP conversation that follows using [`HidDevice::send`] and
-//! [`HidDevice::recv`].
+//! Callers are expected to drive the CTAP conversation that follows using [`crate::hidraw::HidDevice::send`] and
+//! [`crate::hidraw::HidDevice::recv`].
 
 use std::fs::{File, OpenOptions};
 use std::io;

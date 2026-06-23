@@ -29,7 +29,7 @@ log = "0.4"
 mockall = { version = "0.11", optional = true }
 p256 = { version = "0.13", features = ["arithmetic", "jwk", "pem"] }
 passkey-transports = { path = "../passkey-transports", version = "0.1" }
-passkey-types = { path = "../passkey-types", version = "0.5" }
+passkey-types = { path = "../passkey-types", version = "0.6" }
 rand = "0.8"
 tokio = { version = "1", features = ["sync"], optional = true }
 
@@ -40,7 +40,7 @@ authenticator = { version = "0.4", default-features = false, features = [
 ciborium = "0.2"
 generic-array = { version = "=0.14.7", default-features = false }
 mockall = { version = "0.11" }
-passkey-types = { path = "../passkey-types", version = "0.5", features = [
+passkey-types = { path = "../passkey-types", version = "0.6", features = [
   "testable",
 ] }
 serde_cbor = "0.11"
