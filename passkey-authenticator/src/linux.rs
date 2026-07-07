@@ -23,7 +23,7 @@ use passkey_transports::hidraw::{DeviceInfo, HidDevice, HidrawError, enumerate_f
 use passkey_types::ctap2::{
     Ctap2Error, StatusCode, U2FError, get_assertion, get_info, make_credential,
 };
-use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 
 use crate::Ctap2Api;
 
@@ -90,6 +90,14 @@ impl std::error::Error for OpenError {
 /// Construct with [`LinuxAuthenticator::open`]; enumerate candidate devices with
 /// [`LinuxAuthenticator::list_devices`].
 pub struct LinuxAuthenticator {
+    /// Inner authenticator.
+    pub inner: LinuxAuthenticatorInner,
+    /// Send a message here to cancel the current transaction.
+    pub cancel_tx: mpsc::Sender<()>,
+}
+
+/// Inner LinuxAuthenticator which interfaces with and contains info about the device.
+pub struct LinuxAuthenticatorInner {
     device: HidDevice,
     channel: u32,
     capabilities: Capabilities,
@@ -101,9 +109,104 @@ pub struct LinuxAuthenticator {
     /// `Response` values cheaply, and avoids requiring `Clone` on the response
     /// type, which lives in `passkey-types`.
     get_info_cbor: Vec<u8>,
-    /// A caller performing a multi-packet CBOR transaction on this device must acquire this lock so
-    /// concurrent callers don't interleave packets on the wire.
-    txn_lock: Mutex<()>,
+    cancel_rx: mpsc::Receiver<()>,
+}
+
+impl LinuxAuthenticatorInner {
+    /// Issue `authenticatorMakeCredential` against the device.
+    pub async fn make_credential(
+        &mut self,
+        request: make_credential::Request,
+    ) -> Result<make_credential::Response, StatusCode> {
+        let mut body = Vec::new();
+        ciborium::ser::into_writer(&request, &mut body)
+            .map_err(|_| StatusCode::from(U2FError::Other))?;
+        let response = self
+            .send_cbor_with_cancel(CTAP_CMD_MAKE_CREDENTIAL, &body)
+            .await
+            .map_err(StatusCode::from)?;
+        ciborium::de::from_reader(response.as_slice())
+            .map_err(|_| StatusCode::from(Ctap2Error::InvalidCbor))
+    }
+
+    /// Issue `authenticatorGetAssertion` against the device.
+    pub async fn get_assertion(
+        &mut self,
+        request: get_assertion::Request,
+    ) -> Result<get_assertion::Response, StatusCode> {
+        let mut body = Vec::new();
+        ciborium::ser::into_writer(&request, &mut body)
+            .map_err(|_| StatusCode::from(U2FError::Other))?;
+        let response = self
+            .send_cbor_with_cancel(CTAP_CMD_GET_ASSERTION, &body)
+            .await
+            .map_err(StatusCode::from)?;
+        ciborium::de::from_reader(response.as_slice())
+            .map_err(|_| StatusCode::from(Ctap2Error::InvalidCbor))
+    }
+
+    /// Send a CTAPHID_CBOR request and await its response, forwarding any
+    /// signal received on `cancel_rx` to the device as a `CTAPHID_CANCEL`
+    /// without cancelling the outstanding `recv`. The pending recv is kept
+    /// alive across signals so a response (typically `KeepAliveCancel`) is
+    /// always drained before returning.
+    async fn send_cbor_with_cancel(
+        &mut self,
+        command: u8,
+        body: &[u8],
+    ) -> Result<Vec<u8>, TransactionError> {
+        // Drop any cancel signals that arrived before this call started so
+        // they don't immediately abort the request we're about to send.
+        while self.cancel_rx.try_recv().is_ok() {}
+
+        let mut payload = Vec::with_capacity(1 + body.len());
+        payload.push(command);
+        payload.extend_from_slice(body);
+
+        let msg = Message::new(self.channel, Command::Cbor, &payload)
+            .map_err(|_| TransactionError::Hid(HidrawError::MessageTooLarge))?;
+        self.device
+            .send(&msg)
+            .await
+            .map_err(TransactionError::Hid)?;
+
+        let device = &self.device;
+        let channel = self.channel;
+        let cancel_rx = &mut self.cancel_rx;
+
+        let recv_fut = device.recv(channel);
+        tokio::pin!(recv_fut);
+        let response = loop {
+            tokio::select! {
+                result = &mut recv_fut => break result.map_err(TransactionError::Hid)?,
+                maybe_cancel = cancel_rx.recv() => match maybe_cancel {
+                    Some(()) => {
+                        let cancel_msg = Message::new(channel, Command::Cancel, &[])
+                            .map_err(|_| TransactionError::Hid(HidrawError::MessageTooLarge))?;
+                        device.send(&cancel_msg).await.map_err(TransactionError::Hid)?;
+                    }
+                    None => break (&mut recv_fut).await.map_err(TransactionError::Hid)?,
+                },
+            }
+        };
+
+        if !matches!(response.command, Command::Cbor) {
+            return Err(TransactionError::Hid(HidrawError::Protocol(
+                "unexpected CTAPHID command in response",
+            )));
+        }
+        let mut bytes = response.payload;
+        if bytes.is_empty() {
+            return Err(TransactionError::Hid(HidrawError::Protocol(
+                "empty CTAPHID_CBOR response",
+            )));
+        }
+        let status = bytes.remove(0);
+        if status != 0 {
+            return Err(TransactionError::Status(StatusCode::from(status)));
+        }
+        Ok(bytes)
+    }
 }
 
 impl LinuxAuthenticator {
@@ -128,69 +231,53 @@ impl LinuxAuthenticator {
         let _: get_info::Response =
             ciborium::de::from_reader(raw.as_slice()).map_err(|_| OpenError::InvalidGetInfo)?;
 
-        Ok(Self {
-            device,
-            channel: init.channel,
-            capabilities: init.capabilities,
-            get_info_cbor: raw,
-            txn_lock: Mutex::new(()),
+        let (tx, rx) = mpsc::channel(1);
+        Ok(LinuxAuthenticator {
+            inner: LinuxAuthenticatorInner {
+                device,
+                channel: init.channel,
+                capabilities: init.capabilities,
+                get_info_cbor: raw,
+                cancel_rx: rx,
+            },
+            cancel_tx: tx,
         })
     }
 
     /// Capabilities reported by the device in its `CTAPHID_INIT` response.
     pub fn capabilities(&self) -> Capabilities {
-        self.capabilities
+        self.inner.capabilities
     }
 
-    /// Issue `authenticatorMakeCredential` against the device. Holds an internal mutex for the
-    /// duration of the transaction to keep wire packets in order.
-    pub async fn make_credential(
-        &self,
-        request: make_credential::Request,
-    ) -> Result<make_credential::Response, StatusCode> {
-        let mut body = Vec::new();
-        ciborium::ser::into_writer(&request, &mut body)
-            .map_err(|_| StatusCode::from(U2FError::Other))?;
-        let _guard = self.txn_lock.lock().await;
-        let response = send_cbor(&self.device, self.channel, CTAP_CMD_MAKE_CREDENTIAL, &body)
-            .await
-            .map_err(StatusCode::from)?;
-        ciborium::de::from_reader(response.as_slice())
-            .map_err(|_| StatusCode::from(Ctap2Error::InvalidCbor))
-    }
-
-    /// Issue `authenticatorGetAssertion` against the device. See [`Self::make_credential`].
-    pub async fn get_assertion(
-        &self,
-        request: get_assertion::Request,
-    ) -> Result<get_assertion::Response, StatusCode> {
-        let mut body = Vec::new();
-        ciborium::ser::into_writer(&request, &mut body)
-            .map_err(|_| StatusCode::from(U2FError::Other))?;
-        let _guard = self.txn_lock.lock().await;
-        let response = send_cbor(&self.device, self.channel, CTAP_CMD_GET_ASSERTION, &body)
-            .await
-            .map_err(StatusCode::from)?;
-        ciborium::de::from_reader(response.as_slice())
-            .map_err(|_| StatusCode::from(Ctap2Error::InvalidCbor))
-    }
-
-    /// Send `CTAPHID_CANCEL` on this authenticator's channel without taking the
-    /// transaction mutex.
-    ///
-    /// This causes any in-flight `CTAPHID_CBOR` request on the same channel to be aborted; the
-    /// awaiting `make_credential` / `get_assertion` future will return
-    /// `Ctap2Error::KeepAliveCancel`. Calling this on a channel with no in-flight request is a
-    /// no-op (the device ignores it).
+    /// Signal an in-flight `make_credential` / `get_assertion` call to send
+    /// `CTAPHID_CANCEL` on its channel. The awaiting call keeps its `recv`
+    /// alive and returns whatever the device produces (typically
+    /// `Ctap2Error::KeepAliveCancel`). A signal delivered when no call is in
+    /// flight is buffered and applied to the next one.
     pub async fn cancel(&self) -> Result<(), HidrawError> {
-        let msg = Message::new(self.channel, Command::Cancel, &[])
-            .map_err(|_| HidrawError::MessageTooLarge)?;
-        self.device.send(&msg).await
+        let _ = self.cancel_tx.try_send(());
+        Ok(())
     }
 
     /// Read and decode the cached `authenticatorGetInfo` response.
     pub fn info(&self) -> get_info::Response {
-        ciborium::de::from_reader(self.get_info_cbor.as_slice()).unwrap_or_default()
+        ciborium::de::from_reader(self.inner.get_info_cbor.as_slice()).unwrap_or_default()
+    }
+
+    /// Issue `authenticatorMakeCredential` against the device.
+    pub async fn make_credential(
+        &mut self,
+        request: make_credential::Request,
+    ) -> Result<make_credential::Response, StatusCode> {
+        self.inner.make_credential(request).await
+    }
+
+    /// Issue `authenticatorGetAssertion` against the device.
+    pub async fn get_assertion(
+        &mut self,
+        request: get_assertion::Request,
+    ) -> Result<get_assertion::Response, StatusCode> {
+        self.inner.get_assertion(request).await
     }
 }
 

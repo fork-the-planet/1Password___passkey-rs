@@ -19,26 +19,27 @@
 //! let created = client.register(origin, request, DefaultClientData).await?;
 //! ```
 
-use std::sync::Arc;
+use std::future::Future;
 
 use coset::{Algorithm, iana::EnumI64};
 use passkey_authenticator::linux::{LinuxAuthenticator, OpenError};
 use passkey_authenticator::public_key_der_from_cose_key;
 use passkey_types::{
-    crypto::sha256,
     ctap2, encoding,
     webauthn::{
         self, AuthenticatedPublicKeyCredential, AuthenticatorAssertionResponse,
         AuthenticatorAttachment, AuthenticatorAttestationResponse, ClientDataType,
-        CollectedClientData, CreatedPublicKeyCredential, CredentialCreationOptions,
-        CredentialRequestOptions, PublicKeyCredentialParameters, PublicKeyCredentialType,
-        ResidentKeyRequirement, UserVerificationRequirement,
+        CreatedPublicKeyCredential, CredentialCreationOptions, CredentialRequestOptions,
+        PublicKeyCredentialParameters, PublicKeyCredentialType,
     },
 };
 use serde::Serialize;
-use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
-use crate::{ClientData, Fetcher, Origin, RpIdVerifier, WebauthnError};
+use crate::{
+    ClientData, Fetcher, Origin, RpIdVerifier, WebauthnError, build_client_data, ctap_uv_option,
+    map_rk,
+};
 
 /// A WebAuthn client backed by zero or more USB security keys serving as authenticators.
 pub struct LinuxClient<P, F>
@@ -46,7 +47,7 @@ where
     P: public_suffix::EffectiveTLDProvider + Sync + 'static,
     F: Fetcher + Sync,
 {
-    devices: Vec<Arc<LinuxAuthenticator>>,
+    devices: Vec<LinuxAuthenticator>,
     rp_id_verifier: RpIdVerifier<P, F>,
     uv_when_preferred: bool,
 }
@@ -56,7 +57,7 @@ impl LinuxClient<public_suffix::PublicSuffixList, ()> {
     /// TLD provider.
     pub fn new(authenticators: Vec<LinuxAuthenticator>) -> Self {
         Self {
-            devices: authenticators.into_iter().map(Arc::new).collect(),
+            devices: authenticators,
             rp_id_verifier: RpIdVerifier::new(public_suffix::DEFAULT_PROVIDER, None),
             uv_when_preferred: true,
         }
@@ -88,7 +89,7 @@ where
         fetcher: Option<F>,
     ) -> Self {
         Self {
-            devices: authenticators.into_iter().map(Arc::new).collect(),
+            devices: authenticators,
             rp_id_verifier: RpIdVerifier::new(custom_provider, fetcher),
             uv_when_preferred: true,
         }
@@ -113,7 +114,7 @@ where
 
     /// Register a credential by racing every connected security key.
     pub async fn register<D: ClientData<E>, E: Serialize + Clone>(
-        &self,
+        &mut self,
         origin: impl Into<Origin<'_>>,
         request: CredentialCreationOptions,
         client_data: D,
@@ -127,19 +128,12 @@ where
             .await?;
         let rp_id = rp_id.to_owned();
 
-        let collected_client_data = CollectedClientData::<E> {
-            ty: ClientDataType::Create,
-            challenge: encoding::base64url(&opts.challenge),
-            origin: origin.to_string(),
-            cross_origin: None,
-            extra_data: client_data.extra_client_data(),
-            unknown_keys: Default::default(),
-        };
-        let client_data_json = serde_json::to_string(&collected_client_data)
-            .map_err(|_| WebauthnError::SerializationError)?;
-        let client_data_hash = client_data
-            .client_data_hash()
-            .unwrap_or_else(|| sha256(client_data_json.as_bytes()).to_vec());
+        let (client_data_json, client_data_hash) = build_client_data(
+            &client_data,
+            ClientDataType::Create,
+            &opts.challenge,
+            &origin,
+        )?;
 
         let pub_key_cred_params = if opts.pub_key_cred_params.is_empty() {
             PublicKeyCredentialParameters::default_algorithms()
@@ -152,28 +146,33 @@ where
             .as_ref()
             .map(|s| s.user_verification)
             .unwrap_or_default();
-        let uv = self.ctap_uv_option(uv_requirement);
+        let uv = ctap_uv_option(uv_requirement, self.uv_when_preferred);
 
-        // Per-device filter + tailored request build.
-        let mut candidates: Vec<(Arc<LinuxAuthenticator>, ctap2::make_credential::Request)> =
-            Vec::with_capacity(self.devices.len());
-        for device in &self.devices {
+        // Per-device filter + tailored request build. Owned devices that don't
+        // qualify are held aside so we can restore them after the race.
+        let devices = std::mem::take(&mut self.devices);
+        let mut candidates: Vec<(LinuxAuthenticator, ctap2::make_credential::Request)> = Vec::new();
+        let mut preserved: Vec<LinuxAuthenticator> = Vec::new();
+        for device in devices {
             let info = device.info();
 
             let rk = map_rk(opts.authenticator_selection.as_ref(), &info);
             if rk && !info.options.as_ref().is_some_and(|o| o.rk) {
                 // RP requires a resident key but this device can't store one.
+                preserved.push(device);
                 continue;
             }
             if uv && !device_supports_uv(&info) {
                 // RP requires UV but this device has no built-in UV (and we don't implement
                 // clientPIN yet, so PIN-only devices can't satisfy `uv`).
+                preserved.push(device);
                 continue;
             }
 
             let matched_params = filter_algorithms(&pub_key_cred_params, &info);
             if matched_params.is_empty() {
                 // None of the algorithms requested by the RP are supported by this authenticator.
+                preserved.push(device);
                 continue;
             }
 
@@ -191,20 +190,36 @@ where
                 pin_auth: None,
                 pin_protocol: None,
             };
-            candidates.push((Arc::clone(device), request));
+            candidates.push((device, request));
         }
 
         if candidates.is_empty() {
+            self.devices = preserved;
             return Err(WebauthnError::NotSupportedError);
         }
 
-        let ctap2_response = race_make_credential(candidates).await?;
+        let (winner, errors, returned) = race_request(candidates, |mut auth, req| async move {
+            let result = auth.inner.make_credential(req).await;
+            (auth, result)
+        })
+        .await;
+        self.devices = preserved;
+        self.devices.extend(returned);
+        let ctap2_response = winner.ok_or_else(move || {
+            errors
+                .into_iter()
+                .next_back()
+                .map(WebauthnError::from)
+                .unwrap_or(WebauthnError::NotSupportedError)
+        })?;
 
         let credential_id = ctap2_response
             .auth_data
             .attested_credential_data
             .as_ref()
-            .ok_or(WebauthnError::AuthenticatorError(0x7F))?;
+            .ok_or(WebauthnError::AuthenticatorError(
+                ctap2::StatusCode::Ctap1(ctap2::U2FError::Other).into(),
+            ))?;
         let alg = match credential_id.key.alg.as_ref() {
             Some(Algorithm::PrivateUse(val)) => *val,
             Some(Algorithm::Assigned(a)) => EnumI64::to_i64(a),
@@ -237,7 +252,7 @@ where
 
     /// Get assertion for a credential by racing every connected security key.
     pub async fn authenticate<D: ClientData<E>, E: Serialize + Clone>(
-        &self,
+        &mut self,
         origin: impl Into<Origin<'_>>,
         request: CredentialRequestOptions,
         client_data: D,
@@ -251,27 +266,18 @@ where
             .await?;
         let rp_id = rp_id.to_owned();
 
-        let collected_client_data = CollectedClientData::<E> {
-            ty: ClientDataType::Get,
-            challenge: encoding::base64url(&opts.challenge),
-            origin: origin.to_string(),
-            cross_origin: None,
-            extra_data: client_data.extra_client_data(),
-            unknown_keys: Default::default(),
-        };
-        let client_data_json = serde_json::to_string(&collected_client_data)
-            .map_err(|_| WebauthnError::SerializationError)?;
-        let client_data_hash = client_data
-            .client_data_hash()
-            .unwrap_or_else(|| sha256(client_data_json.as_bytes()).to_vec());
+        let (client_data_json, client_data_hash) =
+            build_client_data(&client_data, ClientDataType::Get, &opts.challenge, &origin)?;
 
-        let uv = self.ctap_uv_option(opts.user_verification);
+        let uv = ctap_uv_option(opts.user_verification, self.uv_when_preferred);
 
-        let mut candidates: Vec<(Arc<LinuxAuthenticator>, ctap2::get_assertion::Request)> =
-            Vec::with_capacity(self.devices.len());
-        for device in &self.devices {
+        let devices = std::mem::take(&mut self.devices);
+        let mut candidates: Vec<(LinuxAuthenticator, ctap2::get_assertion::Request)> = Vec::new();
+        let mut preserved: Vec<LinuxAuthenticator> = Vec::new();
+        for device in devices {
             let info = device.info();
             if uv && !device_supports_uv(&info) {
+                preserved.push(device);
                 continue;
             }
             let request = ctap2::get_assertion::Request {
@@ -283,14 +289,39 @@ where
                 pin_auth: None,
                 pin_protocol: None,
             };
-            candidates.push((Arc::clone(device), request));
+            candidates.push((device, request));
         }
 
         if candidates.is_empty() {
+            self.devices = preserved;
             return Err(WebauthnError::NotSupportedError);
         }
 
-        let ctap2_response = race_get_assertion(candidates).await?;
+        let (winner, errors, returned) = race_request(candidates, |mut auth, req| async move {
+            let result = auth.inner.get_assertion(req).await;
+            (auth, result)
+        })
+        .await;
+        self.devices = preserved;
+        self.devices.extend(returned);
+        let ctap2_response = winner.ok_or_else(move || {
+            // Preserve the earlier behaviour: if every candidate reported
+            // "no credentials", surface CredentialNotFound; otherwise surface
+            // the most recent non-CredentialNotFound error.
+            let mapped: Vec<WebauthnError> = errors.into_iter().map(WebauthnError::from).collect();
+            let has_other = mapped
+                .iter()
+                .any(|e| !matches!(e, WebauthnError::CredentialNotFound));
+            if !mapped.is_empty() && !has_other {
+                WebauthnError::CredentialNotFound
+            } else {
+                mapped
+                    .into_iter()
+                    .rev()
+                    .find(|e| !matches!(e, WebauthnError::CredentialNotFound))
+                    .unwrap_or(WebauthnError::NotSupportedError)
+            }
+        })?;
 
         let credential_id_bytes = match ctap2_response.credential {
             Some(c) => c.id.to_vec(),
@@ -311,48 +342,12 @@ where
             client_extension_results: Default::default(),
         })
     }
-
-    fn ctap_uv_option(&self, requirement: UserVerificationRequirement) -> bool {
-        match requirement {
-            UserVerificationRequirement::Discouraged => false,
-            UserVerificationRequirement::Required => true,
-            UserVerificationRequirement::Preferred => self.uv_when_preferred,
-        }
-    }
 }
 
 /// Whether the given `get_info::Response` indicates that the device supports a user verification
 /// method that's already configured.
 fn device_supports_uv(info: &ctap2::get_info::Response) -> bool {
     info.options.as_ref().and_then(|o| o.uv).unwrap_or(false)
-}
-
-/// Copy of `Client::map_rk`.
-// TODO: Should that method be moved out of `Client`? It's pretty much an exact duplicate.
-fn map_rk(
-    sel: Option<&webauthn::AuthenticatorSelectionCriteria>,
-    info: &ctap2::get_info::Response,
-) -> bool {
-    let supports_rk = info.options.as_ref().is_some_and(|o| o.rk);
-    match sel.unwrap_or(&Default::default()) {
-        webauthn::AuthenticatorSelectionCriteria {
-            resident_key: Some(ResidentKeyRequirement::Required),
-            ..
-        } => true,
-        webauthn::AuthenticatorSelectionCriteria {
-            resident_key: Some(ResidentKeyRequirement::Preferred),
-            ..
-        } => supports_rk,
-        webauthn::AuthenticatorSelectionCriteria {
-            resident_key: Some(ResidentKeyRequirement::Discouraged),
-            ..
-        } => false,
-        webauthn::AuthenticatorSelectionCriteria {
-            resident_key: None,
-            require_resident_key,
-            ..
-        } => *require_resident_key,
-    }
 }
 
 /// Keep only the algorithms the device's `get_info` advertises (if it advertises any). The
@@ -373,101 +368,77 @@ fn filter_algorithms(
         .collect()
 }
 
-/// Race `make_credential` across all candidates and cancel the losers once a
-/// winner has been found.
-async fn race_make_credential(
-    candidates: Vec<(Arc<LinuxAuthenticator>, ctap2::make_credential::Request)>,
-) -> Result<ctap2::make_credential::Response, WebauthnError> {
-    let (tx, mut rx) = mpsc::channel(candidates.len().max(1));
-    let auths: Vec<Arc<LinuxAuthenticator>> =
-        candidates.iter().map(|(a, _)| Arc::clone(a)).collect();
+/// Race a CTAP request across all candidates and cancel the losers once a
+/// winner has been found. `call` is invoked once per candidate with owned
+/// access to the authenticator and its request; the future it returns must
+/// hand the authenticator back so the [`LinuxClient`] can keep using it.
+///
+/// Returns the winning response (if any), the [`ctap2::StatusCode`]s produced
+/// by the tasks that had already completed by the time a winner emerged, and
+/// every authenticator that entered the race.
+async fn race_request<Req, R, C, F>(
+    candidates: Vec<(LinuxAuthenticator, Req)>,
+    call: C,
+) -> (Option<R>, Vec<ctap2::StatusCode>, Vec<LinuxAuthenticator>)
+where
+    C: Fn(LinuxAuthenticator, Req) -> F,
+    F: Future<Output = (LinuxAuthenticator, Result<R, ctap2::StatusCode>)> + Send + 'static,
+    Req: Send + 'static,
+    R: Send + 'static,
+{
+    // Clone each authenticator's cancel sender before moving the
+    // authenticator into its task. These clones let us send a `Command::Cancel`
+    // to the losers via `LinuxAuthenticator::cancel_tx`.
+    let cancel_txs: Vec<_> = candidates
+        .iter()
+        .map(|(auth, _)| auth.cancel_tx.clone())
+        .collect();
 
+    let mut set: JoinSet<(usize, LinuxAuthenticator, Result<R, ctap2::StatusCode>)> =
+        JoinSet::new();
     for (idx, (auth, request)) in candidates.into_iter().enumerate() {
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            let result = auth.make_credential(request).await;
-            // Channel may be closed if a winner already emerged — ignore.
-            let _ = tx.send((idx, result)).await;
+        let fut = call(auth, request);
+        set.spawn(async move {
+            let (auth, result) = fut.await;
+            (idx, auth, result)
         });
     }
-    drop(tx);
 
+    let mut winner: Option<R> = None;
     let mut winner_idx: Option<usize> = None;
-    let mut winner_response: Option<ctap2::make_credential::Response> = None;
-    let mut last_error: Option<WebauthnError> = None;
-    while let Some((idx, result)) = rx.recv().await {
+    let mut errors: Vec<ctap2::StatusCode> = Vec::new();
+    let mut returned: Vec<LinuxAuthenticator> = Vec::with_capacity(cancel_txs.len());
+    let mut finished: Vec<usize> = Vec::with_capacity(cancel_txs.len());
+
+    // Wait for task completions until we find a winner or exhaust all the tasks.
+    while let Some(join_res) = set.join_next().await {
+        let (idx, auth, result) = join_res.expect("race_request task panicked");
+        finished.push(idx);
+        returned.push(auth);
         match result {
             Ok(resp) => {
+                winner = Some(resp);
                 winner_idx = Some(idx);
-                winner_response = Some(resp);
                 break;
             }
-            Err(sc) => last_error = Some(WebauthnError::from(sc)),
+            Err(sc) => errors.push(sc),
         }
     }
 
-    if let Some(winner_idx) = winner_idx {
-        cancel_losers(&auths, winner_idx).await;
-    }
-
-    winner_response.ok_or(last_error.unwrap_or(WebauthnError::NotSupportedError))
-}
-
-/// Race `get_assertion` across all candidates, similar to `race_make_credential`.
-async fn race_get_assertion(
-    candidates: Vec<(Arc<LinuxAuthenticator>, ctap2::get_assertion::Request)>,
-) -> Result<ctap2::get_assertion::Response, WebauthnError> {
-    let (tx, mut rx) = mpsc::channel(candidates.len().max(1));
-    let auths: Vec<Arc<LinuxAuthenticator>> =
-        candidates.iter().map(|(a, _)| Arc::clone(a)).collect();
-
-    for (idx, (auth, request)) in candidates.into_iter().enumerate() {
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            let result = auth.get_assertion(request).await;
-            let _ = tx.send((idx, result)).await;
-        });
-    }
-    drop(tx);
-
-    let mut winner_idx: Option<usize> = None;
-    let mut winner_response: Option<ctap2::get_assertion::Response> = None;
-    let mut all_no_credentials = true;
-    let mut last_other_error: Option<WebauthnError> = None;
-    while let Some((idx, result)) = rx.recv().await {
-        match result {
-            Ok(resp) => {
-                winner_idx = Some(idx);
-                winner_response = Some(resp);
-                break;
-            }
-            Err(sc) => {
-                let err = WebauthnError::from(sc);
-                if !matches!(err, WebauthnError::CredentialNotFound) {
-                    all_no_credentials = false;
-                    last_other_error = Some(err);
-                }
+    // Signal the still-running losers to cancel.
+    if let Some(win_idx) = winner_idx {
+        for (i, tx) in cancel_txs.iter().enumerate() {
+            if i != win_idx && !finished.contains(&i) {
+                let _ = tx.try_send(());
             }
         }
     }
 
-    if let Some(winner_idx) = winner_idx {
-        cancel_losers(&auths, winner_idx).await;
+    // Wait on any remaining tasks so the transactions finish and we get the authenticators back.
+    while let Some(join_res) = set.join_next().await {
+        let (_idx, auth, _result) = join_res.expect("race_request task panicked");
+        returned.push(auth);
     }
 
-    if let Some(resp) = winner_response {
-        Ok(resp)
-    } else if all_no_credentials {
-        Err(WebauthnError::CredentialNotFound)
-    } else {
-        Err(last_other_error.unwrap_or(WebauthnError::NotSupportedError))
-    }
-}
-
-async fn cancel_losers(auths: &[Arc<LinuxAuthenticator>], winner_idx: usize) {
-    for (i, auth) in auths.iter().enumerate() {
-        if i != winner_idx {
-            let _ = auth.cancel().await;
-        }
-    }
+    (winner, errors, returned)
 }

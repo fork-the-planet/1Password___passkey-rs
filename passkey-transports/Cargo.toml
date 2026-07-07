@@ -18,16 +18,16 @@ workspace = true
 
 [features]
 default = []
-linux = []
+linux = ["dep:nix", "dep:tokio", "dep:rand"]
 
 [dependencies]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
-nix = { version = "0.29", features = ["fs", "ioctl"] }
-tokio = { version = "1", features = ["net", "rt", "sync", "macros", "time"] }
+nix = { version = "0.29", features = ["ioctl"], optional = true }
+tokio = { version = "1", features = ["net"], optional = true }
 udev = "0.9"
 hidparser = "1.0"
-rand = { version = "0.10", features = ["chacha"] }
+rand = { version = "0.10", optional = true }
 
 [dev-dependencies]

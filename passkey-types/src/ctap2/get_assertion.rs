@@ -3,9 +3,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Bytes,
-    ctap2::AuthenticatorData,
+    ctap2::{AuthenticatorData, make_credential::PublicKeyCredentialUserEntity},
     utils::serde::{ignore_unknown, ignore_unknown_opt_vec},
-    webauthn::{PublicKeyCredentialDescriptor, PublicKeyCredentialUserEntity},
+    webauthn::PublicKeyCredentialDescriptor,
 };
 
 #[cfg(doc)]

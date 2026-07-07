@@ -16,7 +16,7 @@ async fn client_setup(
     user_entity: PublicKeyCredentialUserEntity,
 ) -> Result<(CreatedPublicKeyCredential, AuthenticatedPublicKeyCredential), WebauthnError> {
     // Create the Client
-    let my_client = LinuxClient::open_all()
+    let mut my_client = LinuxClient::open_all()
         .await
         .unwrap()
         .user_verification_when_preferred(false);

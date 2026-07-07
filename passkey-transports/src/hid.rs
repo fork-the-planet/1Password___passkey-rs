@@ -296,6 +296,9 @@ pub struct Message {
     pub payload: Vec<u8>,
 }
 
+/// Sequence of packets that can be sent over HIDRAW; each packet has an extra leading zero byte.
+pub struct HidrawPackets(pub Vec<[u8; MAX_PACKET_SIZE + 1]>);
+
 /// Error when trying to extend a message from a newly recieved Continuation packet.
 #[derive(Debug)]
 enum ExtensionError {
@@ -357,6 +360,25 @@ impl Message {
                 buf
             })
             .collect()
+    }
+
+    /// Similar to [`Self::encode_packets`] but adds a zero byte to the beginning of each packet
+    /// to indicate the report ID. This is useful for Linux HIDRAW - even though CTAPHID doesn't
+    /// use numbered reports, the HIDRAW API still requires that a zero byte is prepended.
+    #[cfg(all(feature = "linux", target_os = "linux"))]
+    pub fn encode_packets_with_leading_zero_byte(&self) -> HidrawPackets {
+        let packets = self.to_packets();
+        HidrawPackets(
+            packets
+                .into_iter()
+                .map(|(header, data)| {
+                    let mut buf = [0u8; MAX_PACKET_SIZE + 1];
+                    let [_, payload @ ..] = &mut buf;
+                    header.encode(data, payload);
+                    buf
+                })
+                .collect(),
+        )
     }
 
     /// Break up a [Message] into packets which are a tuple of the packet's header and its associated

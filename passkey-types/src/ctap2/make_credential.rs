@@ -116,7 +116,12 @@ pub struct PublicKeyCredentialRpEntity {
 }
 
 /// This is a copy of [`webauthn::PublicKeyCredentialUserEntity`] with differing optional fields.
+///
+/// Field names match the CTAP2 wire format (`displayName`, `icon`) rather than the WebAuthn JSON
+/// names, so this type can be used to decode `authenticatorGetAssertion` responses where the
+/// authenticator may legally omit anything beyond `id`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PublicKeyCredentialUserEntity {
     /// The ID of the user
     pub id: Bytes,
@@ -126,8 +131,9 @@ pub struct PublicKeyCredentialUserEntity {
     /// Optional display name
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
-    /// Optional URL pointing to a user icon
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional URL pointing to a user icon.
+    /// CTAP2 calls this field `icon`, not `iconUrl`.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "icon")]
     pub icon_url: Option<String>,
 }
 

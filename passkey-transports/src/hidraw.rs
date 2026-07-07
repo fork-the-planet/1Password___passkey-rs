@@ -9,15 +9,14 @@
 //! [`crate::hidraw::HidDevice::recv`].
 
 use std::fs::{File, OpenOptions};
-use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use hidparser::ReportField;
 use rand::Rng;
-use rand::rngs::ChaCha20Rng;
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tokio::time::timeout;
@@ -209,7 +208,8 @@ fn device_has_fido_usage(file: &File) -> io::Result<bool> {
 /// Walk an HID report descriptor and return whether it includes a `Usage Page (0xF1D0)` item.
 fn report_descriptor_has_fido_usage(desc: &[u8]) -> bool {
     let Ok(descriptor) = hidparser::parse_report_descriptor(desc) else {
-        // TODO: Should this return an error instead?
+        // Report descriptor failed to parse; don't return it, since this is probably caused by a
+        // broken device or kernel module out of our control
         return false;
     };
     if descriptor.input_reports.is_empty() {
@@ -253,7 +253,7 @@ mod ioctls {
 /// [`HidDevice::init`] once after opening to perform the `CTAPHID_INIT` handshake
 /// and obtain a per-application channel identifier.
 pub struct HidDevice {
-    fd: AsyncFd<OwnedFd>,
+    fd: AsyncFd<File>,
 }
 
 impl HidDevice {
@@ -268,8 +268,8 @@ impl HidDevice {
             .write(true)
             .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(path)?;
-        let fd: OwnedFd = file.into();
-        let fd = AsyncFd::with_interest(fd, Interest::READABLE | Interest::WRITABLE)?;
+        // let fd: OwnedFd = file.into();
+        let fd = AsyncFd::with_interest(file, Interest::READABLE | Interest::WRITABLE)?;
         Ok(Self { fd })
     }
 
@@ -278,30 +278,14 @@ impl HidDevice {
     /// The HIDRAW write interface requires a report-ID prefix byte. FIDO devices do not use
     /// numbered reports, so we always prepend `0x00` (as per [the HIDRAW
     /// docs](https://docs.kernel.org/hid/hidraw.html)), giving a 65-byte write.
-    async fn write_packet(&self, packet: &[u8; MAX_PACKET_SIZE]) -> io::Result<()> {
-        let mut framed = [0u8; MAX_PACKET_SIZE + 1];
-        framed[1..].copy_from_slice(packet);
-
+    async fn write_packet(&self, packet: &[u8; MAX_PACKET_SIZE + 1]) -> io::Result<()> {
         let mut written = 0;
-        while written < framed.len() {
+        while written < packet.len() {
             let mut guard = self.fd.writable().await?;
-            let buf = &framed[written..];
+            let buf = &packet[written..];
             match guard.try_io(|inner| {
-                // SAFETY: `inner.get_ref()` returns a reference to an owned fd that
-                // outlives this call. `buf.as_ptr()` and `buf.len()` describe an
-                // in-bounds region of `framed`.
-                let n = unsafe {
-                    libc::write(
-                        inner.get_ref().as_raw_fd(),
-                        buf.as_ptr().cast::<libc::c_void>(),
-                        buf.len(),
-                    )
-                };
-                if n < 0 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(usize::try_from(n).expect("non-negative isize should fit in usize"))
-                }
+                let n = inner.get_ref().write(buf)?;
+                Ok(n)
             }) {
                 Ok(Ok(n)) => {
                     if n == 0 {
@@ -329,21 +313,8 @@ impl HidDevice {
         loop {
             let mut guard = self.fd.readable().await?;
             match guard.try_io(|inner| {
-                // SAFETY: `inner.get_ref()` returns a reference to an owned fd that
-                // outlives this call. `buf.as_mut_ptr()` and `buf.len()` describe an
-                // in-bounds region of `buf`.
-                let n = unsafe {
-                    libc::read(
-                        inner.get_ref().as_raw_fd(),
-                        buf.as_mut_ptr().cast::<libc::c_void>(),
-                        buf.len(),
-                    )
-                };
-                if n < 0 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(usize::try_from(n).unwrap_or(0))
-                }
+                let n = inner.get_ref().read(&mut buf)?;
+                Ok(n)
             }) {
                 Ok(Ok(n)) => {
                     if n != MAX_PACKET_SIZE {
@@ -368,9 +339,8 @@ impl HidDevice {
     /// in sequence.
     pub async fn send(&self, message: &Message) -> Result<(), HidrawError> {
         // We use `message.encode_packets()` here instead of the `Message::send` implementation
-        // because (1) `self.fd` doesn't implement `std::io::Write`, and (2) we need to add the
-        // zero byte at the beginning of each packet for HIDRAW.
-        for packet in message.encode_packets() {
+        // because we need to add the zero byte at the beginning of each packet for HIDRAW.
+        for packet in message.encode_packets_with_leading_zero_byte().0 {
             self.write_packet(&packet).await?;
         }
         Ok(())
@@ -398,7 +368,17 @@ impl HidDevice {
             };
 
             if message.channel != channel {
-                // Stale packet for another channel — drop and keep waiting.
+                // If multiple clients are connected to a single device, the message channel
+                // helps disambiguate them. However, when we read an HID report from HIDRAW, the
+                // report is consumed, which prevents it from being read by other attached clients.
+                // As such, the only way to ensure that all clients receive every intended packet is
+                // by using a separate broker service that processes all packets received through
+                // HIDRAW and forwards them to the correct client.
+                // Unfortunately, since we have no way to guarantee that every client will use such
+                // a broker even if we do implement one, the next best option is to drop all packets
+                // but ours. In practice this isn't such a big problem, as it's fairly unlikely that
+                // multiple clients are attempting to access a single authenticator at the same
+                // time.
                 continue;
             }
             if matches!(message.command, Command::KeepAlive) {
@@ -413,7 +393,7 @@ impl HidDevice {
     pub async fn init(&self) -> Result<InitResponse, HidrawError> {
         let nonce = {
             let mut buf = [0u8; 8];
-            let mut rng: ChaCha20Rng = rand::make_rng();
+            let mut rng = rand::rng();
             rng.fill_bytes(&mut buf);
             buf
         };
