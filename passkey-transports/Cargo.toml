@@ -18,7 +18,7 @@ workspace = true
 
 [features]
 default = []
-linux = ["dep:nix", "dep:tokio", "dep:rand"]
+linux = ["dep:nix", "dep:tokio", "dep:rand", "tokio/time"]
 
 [dependencies]
 

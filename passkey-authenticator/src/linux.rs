@@ -249,16 +249,6 @@ impl LinuxAuthenticator {
         self.inner.capabilities
     }
 
-    /// Signal an in-flight `make_credential` / `get_assertion` call to send
-    /// `CTAPHID_CANCEL` on its channel. The awaiting call keeps its `recv`
-    /// alive and returns whatever the device produces (typically
-    /// `Ctap2Error::KeepAliveCancel`). A signal delivered when no call is in
-    /// flight is buffered and applied to the next one.
-    pub async fn cancel(&self) -> Result<(), HidrawError> {
-        let _ = self.cancel_tx.try_send(());
-        Ok(())
-    }
-
     /// Read and decode the cached `authenticatorGetInfo` response.
     pub fn info(&self) -> get_info::Response {
         ciborium::de::from_reader(self.inner.get_info_cbor.as_slice()).unwrap_or_default()
