@@ -201,7 +201,7 @@ pub struct Options {
     /// This is marked with `skip_serializing` because CTAP 2.0 does not specify a `up` field in
     /// `Options`, while CTAP 2.1 allows the `up` field to be present but requires that its value
     /// be set to true if it is present.
-    #[serde(default = "default_true", skip_serializing)]
+    #[serde(default = "default_true", skip_serializing_if = "is_false")]
     pub up: bool,
     /// User Verification:
     ///
@@ -222,6 +222,10 @@ impl Default for Options {
 
 const fn default_true() -> bool {
     true
+}
+
+const fn is_false(e: &bool) -> bool {
+    !*e
 }
 
 /// All supported Authenticator extensions inputs during credential creation
