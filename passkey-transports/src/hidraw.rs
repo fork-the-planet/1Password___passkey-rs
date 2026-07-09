@@ -39,17 +39,24 @@ const HID_MAX_DESCRIPTOR_SIZE: usize = 4096;
 /// activity indicates the device has stopped responding.
 const PACKET_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Information about a discovered FIDO-capable HID device.
+/// Information about this HID device's identifiers, derived from the HID descriptor.
 #[derive(Debug, Clone)]
-pub struct DeviceInfo {
-    /// Path to the `/dev/hidrawN` device file.
-    pub path: PathBuf,
+pub struct DeviceIdentifierInfo {
     /// USB vendor identifier, if available.
     pub vendor_id: Option<u16>,
     /// USB product identifier, if available.
     pub product_id: Option<u16>,
     /// Human-readable device name reported by the HID descriptor, if available.
     pub name: Option<String>,
+}
+
+/// Information about a discovered FIDO-capable HID device.
+#[derive(Debug, Clone)]
+pub struct DeviceInfo {
+    /// Path to the `/dev/hidrawN` device file.
+    pub path: PathBuf,
+    /// Identifier info for this device.
+    pub id_info: DeviceIdentifierInfo,
 }
 
 /// Errors that may occur while talking to a HIDRAW device.
@@ -123,12 +130,10 @@ pub fn enumerate_fido_devices() -> io::Result<Vec<DeviceInfo>> {
             continue;
         }
 
-        let (vendor_id, product_id, name) = parent_hid_info(&device);
+        let device_identifier_info = parent_hid_info(&device);
         devices.push(DeviceInfo {
             path,
-            vendor_id,
-            product_id,
-            name,
+            id_info: device_identifier_info,
         });
     }
 
@@ -139,9 +144,13 @@ pub fn enumerate_fido_devices() -> io::Result<Vec<DeviceInfo>> {
 ///
 /// The `HID_ID` property is formatted as `BUS:VID:PID` in hex; the `HID_NAME` property
 /// is a free-form human-readable string set by the kernel HID driver.
-fn parent_hid_info(device: &udev::Device) -> (Option<u16>, Option<u16>, Option<String>) {
+fn parent_hid_info(device: &udev::Device) -> DeviceIdentifierInfo {
     let Some(parent) = device.parent_with_subsystem("hid").ok().flatten() else {
-        return (None, None, None);
+        return DeviceIdentifierInfo {
+            vendor_id: None,
+            product_id: None,
+            name: None
+        };
     };
 
     let hid_id = parent
@@ -168,7 +177,11 @@ fn parent_hid_info(device: &udev::Device) -> (Option<u16>, Option<u16>, Option<S
         None => (None, None),
     };
 
-    (vid, pid, hid_name)
+    DeviceIdentifierInfo {
+        vendor_id: vid,
+        product_id: pid,
+        name: hid_name
+    }
 }
 
 /// Run the `HIDIOCGRDESC` ioctl against an open HIDRAW fd and look for the FIDO

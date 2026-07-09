@@ -121,7 +121,7 @@ impl Command {
     }
 }
 /// a CTAP2 HID packet can be at most 64 bytes, bigger messages are broken up using Continuation Packets
-pub const MAX_PACKET_SIZE: usize = 64;
+pub(crate) const MAX_PACKET_SIZE: usize = 64;
 
 /// Initialization Packet header
 ///
@@ -296,8 +296,11 @@ pub struct Message {
     pub payload: Vec<u8>,
 }
 
-/// Sequence of packets that can be sent over HIDRAW; each packet has an extra leading zero byte.
-pub struct HidrawPackets(pub Vec<[u8; MAX_PACKET_SIZE + 1]>);
+/// A `Message` encoded as a sequence of packets.
+pub struct Packets(pub Vec<[u8; MAX_PACKET_SIZE]>);
+
+/// A `Message` encoded as a sequence of packets that can be sent over HIDRAW; each packet has an extra leading zero byte.
+pub(crate) struct HidrawPackets(pub Vec<[u8; MAX_PACKET_SIZE + 1]>);
 
 /// Error when trying to extend a message from a newly recieved Continuation packet.
 #[derive(Debug)]
@@ -338,7 +341,7 @@ impl Message {
 
     /// Send a message to the client by breaking it up into CTAP2 HID packets and sending them in sequence.
     pub fn send<W: std::io::Write>(self, writer: &mut W) -> Result<(), std::io::Error> {
-        for buf in self.encode_packets() {
+        for buf in self.encode_packets().0 {
             let _ = writer.write(&buf)?;
             writer.flush()?;
         }
@@ -350,23 +353,25 @@ impl Message {
     /// Each returned packet is exactly [`MAX_PACKET_SIZE`] bytes and ready to be written to
     /// the transport. Use this when you need to drive the wire encoding yourself (for example
     /// from an async writer that cannot use [`Message::send`]).
-    pub fn encode_packets(&self) -> Vec<[u8; MAX_PACKET_SIZE]> {
+    pub fn encode_packets(&self) -> Packets {
         let packets = self.to_packets();
-        packets
-            .into_iter()
-            .map(|(header, data)| {
-                let mut buf = [0u8; MAX_PACKET_SIZE];
-                header.encode(data, &mut buf);
-                buf
-            })
-            .collect()
+        Packets(
+            packets
+                .into_iter()
+                .map(|(header, data)| {
+                    let mut buf = [0u8; MAX_PACKET_SIZE];
+                    header.encode(data, &mut buf);
+                    buf
+                })
+                .collect()
+        )
     }
 
     /// Similar to [`Self::encode_packets`] but adds a zero byte to the beginning of each packet
     /// to indicate the report ID. This is useful for Linux HIDRAW - even though CTAPHID doesn't
     /// use numbered reports, the HIDRAW API still requires that a zero byte is prepended.
     #[cfg(all(feature = "linux", target_os = "linux"))]
-    pub fn encode_packets_with_leading_zero_byte(&self) -> HidrawPackets {
+    pub(crate) fn encode_packets_with_leading_zero_byte(&self) -> HidrawPackets {
         let packets = self.to_packets();
         HidrawPackets(
             packets
