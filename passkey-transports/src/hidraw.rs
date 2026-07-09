@@ -149,7 +149,7 @@ fn parent_hid_info(device: &udev::Device) -> DeviceIdentifierInfo {
         return DeviceIdentifierInfo {
             vendor_id: None,
             product_id: None,
-            name: None
+            name: None,
         };
     };
 
@@ -180,7 +180,7 @@ fn parent_hid_info(device: &udev::Device) -> DeviceIdentifierInfo {
     DeviceIdentifierInfo {
         vendor_id: vid,
         product_id: pid,
-        name: hid_name
+        name: hid_name,
     }
 }
 

@@ -364,7 +364,7 @@ impl Message {
                     header.encode(data, &mut buf);
                     buf
                 })
-                .collect()
+                .collect(),
         )
     }
 
