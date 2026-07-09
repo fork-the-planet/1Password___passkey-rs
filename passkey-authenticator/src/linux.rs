@@ -21,7 +21,7 @@ use std::path::Path;
 use passkey_transports::hid::{Command, Message};
 use passkey_transports::hidraw::{DeviceInfo, HidDevice, HidrawError, enumerate_fido_devices};
 use passkey_types::ctap2::{
-    Ctap2Error, StatusCode, U2FError, get_assertion, get_info, make_credential,
+    Ctap2Command, Ctap2Error, StatusCode, U2FError, get_assertion, get_info, make_credential,
 };
 use tokio::sync::mpsc;
 
@@ -29,13 +29,6 @@ use crate::Ctap2Api;
 
 // Re-export so callers don't need a direct dep on passkey-transports.
 pub use passkey_transports::hidraw::{Capabilities, DeviceInfo as HidDeviceInfo, InitResponse};
-
-/// CTAP2 command byte for `authenticatorMakeCredential`.
-const CTAP_CMD_MAKE_CREDENTIAL: u8 = 0x01;
-/// CTAP2 command byte for `authenticatorGetAssertion`.
-const CTAP_CMD_GET_ASSERTION: u8 = 0x02;
-/// CTAP2 command byte for `authenticatorGetInfo`.
-const CTAP_CMD_GET_INFO: u8 = 0x04;
 
 /// Errors that can occur while constructing a [`LinuxAuthenticator`].
 #[derive(Debug)]
@@ -122,7 +115,7 @@ impl LinuxAuthenticatorInner {
         ciborium::ser::into_writer(&request, &mut body)
             .map_err(|_| StatusCode::from(U2FError::Other))?;
         let response = self
-            .send_cbor_with_cancel(CTAP_CMD_MAKE_CREDENTIAL, &body)
+            .send_cbor_with_cancel(Ctap2Command::MakeCredential, &body)
             .await
             .map_err(StatusCode::from)?;
         ciborium::de::from_reader(response.as_slice())
@@ -138,7 +131,7 @@ impl LinuxAuthenticatorInner {
         ciborium::ser::into_writer(&request, &mut body)
             .map_err(|_| StatusCode::from(U2FError::Other))?;
         let response = self
-            .send_cbor_with_cancel(CTAP_CMD_GET_ASSERTION, &body)
+            .send_cbor_with_cancel(Ctap2Command::GetAssertion, &body)
             .await
             .map_err(StatusCode::from)?;
         ciborium::de::from_reader(response.as_slice())
@@ -152,7 +145,7 @@ impl LinuxAuthenticatorInner {
     /// always drained before returning.
     async fn send_cbor_with_cancel(
         &mut self,
-        command: u8,
+        command: Ctap2Command,
         body: &[u8],
     ) -> Result<Vec<u8>, TransactionError> {
         // Drop any cancel signals that arrived before this call started so
@@ -160,7 +153,7 @@ impl LinuxAuthenticatorInner {
         while self.cancel_rx.try_recv().is_ok() {}
 
         let mut payload = Vec::with_capacity(1 + body.len());
-        payload.push(command);
+        payload.push(command as u8);
         payload.extend_from_slice(body);
 
         let msg = Message::new(self.channel, Command::Cbor, &payload)
@@ -202,7 +195,7 @@ impl LinuxAuthenticatorInner {
             )));
         }
         let status = bytes.remove(0);
-        if status != 0 {
+        if status != U2FError::Success as u8 {
             return Err(TransactionError::Status(StatusCode::from(status)));
         }
         Ok(bytes)
@@ -226,7 +219,7 @@ impl LinuxAuthenticator {
 
         // Fetch authenticatorGetInfo so we can cache it and surface any obvious
         // device-side errors before returning to the caller.
-        let raw = send_cbor(&device, init.channel, CTAP_CMD_GET_INFO, &[]).await?;
+        let raw = send_cbor(&device, init.channel, Ctap2Command::GetInfo, &[]).await?;
         // Validate that it parses.
         let _: get_info::Response =
             ciborium::de::from_reader(raw.as_slice()).map_err(|_| OpenError::InvalidGetInfo)?;
@@ -306,11 +299,11 @@ impl From<TransactionError> for StatusCode {
 async fn send_cbor(
     device: &HidDevice,
     channel: u32,
-    command: u8,
+    command: Ctap2Command,
     body: &[u8],
 ) -> Result<Vec<u8>, TransactionError> {
     let mut payload = Vec::with_capacity(1 + body.len());
-    payload.push(command);
+    payload.push(command as u8);
     payload.extend_from_slice(body);
 
     let msg = Message::new(channel, Command::Cbor, &payload)
@@ -330,7 +323,7 @@ async fn send_cbor(
         )));
     }
     let status = bytes.remove(0);
-    if status != 0 {
+    if status != U2FError::Success as u8 {
         return Err(TransactionError::Status(StatusCode::from(status)));
     }
     Ok(bytes)
