@@ -152,53 +152,27 @@ impl LinuxAuthenticatorInner {
         // they don't immediately abort the request we're about to send.
         while self.cancel_rx.try_recv().is_ok() {}
 
-        let mut payload = Vec::with_capacity(1 + body.len());
-        payload.push(command as u8);
-        payload.extend_from_slice(body);
-
-        let msg = Message::new(self.channel, Command::Cbor, &payload)
-            .map_err(|_| TransactionError::Hid(HidrawError::MessageTooLarge))?;
-        self.device
-            .send(&msg)
-            .await
-            .map_err(TransactionError::Hid)?;
+        send_cbor(&self.device, self.channel, command, body).await?;
 
         let device = &self.device;
         let channel = self.channel;
         let cancel_rx = &mut self.cancel_rx;
 
-        let recv_fut = device.recv(channel);
+        let recv_fut = recv_cbor(device, channel);
         tokio::pin!(recv_fut);
-        let response = loop {
+        loop {
             tokio::select! {
-                result = &mut recv_fut => break result.map_err(TransactionError::Hid)?,
+                result = &mut recv_fut => return result,
                 maybe_cancel = cancel_rx.recv() => match maybe_cancel {
                     Some(()) => {
                         let cancel_msg = Message::new(channel, Command::Cancel, &[])
                             .map_err(|_| TransactionError::Hid(HidrawError::MessageTooLarge))?;
                         device.send(&cancel_msg).await.map_err(TransactionError::Hid)?;
                     }
-                    None => break (&mut recv_fut).await.map_err(TransactionError::Hid)?,
+                    None => return (&mut recv_fut).await,
                 },
             }
-        };
-
-        if !matches!(response.command, Command::Cbor) {
-            return Err(TransactionError::Hid(HidrawError::Protocol(
-                "unexpected CTAPHID command in response",
-            )));
         }
-        let mut bytes = response.payload;
-        if bytes.is_empty() {
-            return Err(TransactionError::Hid(HidrawError::Protocol(
-                "empty CTAPHID_CBOR response",
-            )));
-        }
-        let status = bytes.remove(0);
-        if status != U2FError::Success as u8 {
-            return Err(TransactionError::Status(StatusCode::from(status)));
-        }
-        Ok(bytes)
     }
 }
 
@@ -219,7 +193,8 @@ impl LinuxAuthenticator {
 
         // Fetch authenticatorGetInfo so we can cache it and surface any obvious
         // device-side errors before returning to the caller.
-        let raw = send_cbor(&device, init.channel, Ctap2Command::GetInfo, &[]).await?;
+        let raw =
+            send_cbor_without_cancel(&device, init.channel, Ctap2Command::GetInfo, &[]).await?;
         // Validate that it parses.
         let _: get_info::Response =
             ciborium::de::from_reader(raw.as_slice()).map_err(|_| OpenError::InvalidGetInfo)?;
@@ -292,16 +267,13 @@ impl From<TransactionError> for StatusCode {
     }
 }
 
-/// Run one CTAPHID_CBOR transaction and return the CBOR body of the response.
-///
-/// Lifted out of [`LinuxAuthenticator`] so it can also be used during construction
-/// before `self` exists.
+/// Send a CTAPHID_CBOR request.
 async fn send_cbor(
     device: &HidDevice,
     channel: u32,
     command: Ctap2Command,
     body: &[u8],
-) -> Result<Vec<u8>, TransactionError> {
+) -> Result<(), TransactionError> {
     let mut payload = Vec::with_capacity(1 + body.len());
     payload.push(command as u8);
     payload.extend_from_slice(body);
@@ -309,7 +281,11 @@ async fn send_cbor(
     let msg = Message::new(channel, Command::Cbor, &payload)
         .map_err(|_| TransactionError::Hid(HidrawError::MessageTooLarge))?;
     device.send(&msg).await.map_err(TransactionError::Hid)?;
+    Ok(())
+}
 
+/// Await a CTAPHID_CBOR response and return its CBOR body.
+async fn recv_cbor(device: &HidDevice, channel: u32) -> Result<Vec<u8>, TransactionError> {
     let response = device.recv(channel).await.map_err(TransactionError::Hid)?;
     if !matches!(response.command, Command::Cbor) {
         return Err(TransactionError::Hid(HidrawError::Protocol(
@@ -327,6 +303,20 @@ async fn send_cbor(
         return Err(TransactionError::Status(StatusCode::from(status)));
     }
     Ok(bytes)
+}
+
+/// Run one CTAPHID_CBOR transaction and return the CBOR body of the response.
+///
+/// Lifted out of [`LinuxAuthenticator`] so it can also be used during construction
+/// before `self` exists.
+async fn send_cbor_without_cancel(
+    device: &HidDevice,
+    channel: u32,
+    command: Ctap2Command,
+    body: &[u8],
+) -> Result<Vec<u8>, TransactionError> {
+    send_cbor(device, channel, command, body).await?;
+    recv_cbor(device, channel).await
 }
 
 #[async_trait::async_trait]
