@@ -19,7 +19,7 @@ workspace = true
 default = []
 testable = ["dep:mockall", "passkey-types/testable"]
 tokio = ["dep:tokio"]
-linux = ["dep:ciborium", "dep:tokio", "dep:passkey-transports", "passkey-transports/linux"]
+linux = ["dep:ciborium", "dep:tokio", "dep:passkey-transports", "tokio/macros", "passkey-transports/linux"]
 
 [dependencies]
 async-trait = "0.1"

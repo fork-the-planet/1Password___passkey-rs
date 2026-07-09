@@ -20,7 +20,7 @@ android-asset-validation = ["dep:nom"]
 testable = ["dep:mockall"]
 tokio = ["dep:tokio"]
 typeshare = ["passkey-types/typeshare", "dep:typeshare"]
-linux = ["dep:tokio", "passkey-authenticator/linux"]
+linux = ["dep:tokio", "passkey-authenticator/linux", "tokio/rt"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
