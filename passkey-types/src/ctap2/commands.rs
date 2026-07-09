@@ -8,3 +8,10 @@ pub enum Ctap2Command {
     /// CTAP_CMD_GET_INFO
     GetInfo = 0x04,
 }
+
+impl From<Ctap2Command> for u8 {
+    #[expect(clippy::as_conversions)]
+    fn from(value: Ctap2Command) -> Self {
+        value as u8
+    }
+}

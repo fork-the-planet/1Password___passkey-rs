@@ -275,7 +275,7 @@ async fn send_cbor(
     body: &[u8],
 ) -> Result<(), TransactionError> {
     let mut payload = Vec::with_capacity(1 + body.len());
-    payload.push(command as u8);
+    payload.push(command.into());
     payload.extend_from_slice(body);
 
     let msg = Message::new(channel, Command::Cbor, &payload)
@@ -299,7 +299,7 @@ async fn recv_cbor(device: &HidDevice, channel: u32) -> Result<Vec<u8>, Transact
         )));
     }
     let status = bytes.remove(0);
-    if status != U2FError::Success as u8 {
+    if status != u8::from(U2FError::Success) {
         return Err(TransactionError::Status(StatusCode::from(status)));
     }
     Ok(bytes)
