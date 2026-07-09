@@ -297,7 +297,7 @@ pub struct Message {
 }
 
 /// A `Message` encoded as a sequence of packets.
-pub struct Packets(pub Vec<[u8; MAX_PACKET_SIZE]>);
+pub(crate) struct Packets(pub Vec<[u8; MAX_PACKET_SIZE]>);
 
 /// A `Message` encoded as a sequence of packets that can be sent over HIDRAW; each packet has an extra leading zero byte.
 #[cfg(all(feature = "linux", target_os = "linux"))]
@@ -354,7 +354,7 @@ impl Message {
     /// Each returned packet is exactly [`MAX_PACKET_SIZE`] bytes and ready to be written to
     /// the transport. Use this when you need to drive the wire encoding yourself (for example
     /// from an async writer that cannot use [`Message::send`]).
-    pub fn encode_packets(&self) -> Packets {
+    pub(crate) fn encode_packets(&self) -> Packets {
         let packets = self.to_packets();
         Packets(
             packets
