@@ -198,13 +198,17 @@ where
             return Err(WebauthnError::NotSupportedError);
         }
 
-        let (winner, errors, returned) = race_request(candidates, |mut auth, req| async move {
+        let RaceOutcome {
+            winner,
+            errors,
+            losers,
+        } = race_request(candidates, |mut auth, req| async move {
             let result = auth.inner.make_credential(req).await;
             (auth, result)
         })
         .await;
         self.devices = preserved;
-        self.devices.extend(returned);
+        self.devices.extend(losers);
         let (ctap2_response, winner_auth) = winner.ok_or_else(move || {
             errors
                 .into_iter()
@@ -305,13 +309,17 @@ where
             return Err(WebauthnError::NotSupportedError);
         }
 
-        let (winner, errors, returned) = race_request(candidates, |mut auth, req| async move {
+        let RaceOutcome {
+            winner,
+            errors,
+            losers,
+        } = race_request(candidates, |mut auth, req| async move {
             let result = auth.inner.get_assertion(req).await;
             (auth, result)
         })
         .await;
         self.devices = preserved;
-        self.devices.extend(returned);
+        self.devices.extend(losers);
         let (ctap2_response, winner_auth) = winner.ok_or_else(move || {
             // Preserve the earlier behaviour: if every candidate reported
             // "no credentials", surface CredentialNotFound; otherwise surface
@@ -377,21 +385,25 @@ fn filter_algorithms(
         .collect()
 }
 
+/// Result of a [`race_request`] call.
+struct RaceOutcome<R> {
+    /// The winning response paired with the authenticator that produced it, or `None` if every
+    /// candidate returned an error.
+    winner: Option<(R, LinuxAuthenticator)>,
+    /// Status codes returned by candidates that had already errored by the time a winner emerged
+    /// (or by the time the race exhausted its candidates).
+    errors: Vec<ctap2::StatusCode>,
+    /// Every authenticator that entered the race except the winner.
+    losers: Vec<LinuxAuthenticator>,
+}
+
 /// Race a CTAP request across all candidates and cancel the losers once a winner has been found.
 /// `call` is invoked once per candidate with owned access to the authenticator and its request; the
 /// future it returns must hand the authenticator back so the [`LinuxClient`] can keep using it.
-///
-/// Returns the winning response paired with the authenticator that produced it (if any), the
-/// [`ctap2::StatusCode`]s produced by the tasks that had already completed by the time a winner
-/// emerged, and every other authenticator that entered the race.
 async fn race_request<Req, R, C, F>(
     candidates: Vec<(LinuxAuthenticator, Req)>,
     call: C,
-) -> (
-    Option<(R, LinuxAuthenticator)>,
-    Vec<ctap2::StatusCode>,
-    Vec<LinuxAuthenticator>,
-)
+) -> RaceOutcome<R>
 where
     C: Fn(LinuxAuthenticator, Req) -> F,
     F: Future<Output = (LinuxAuthenticator, Result<R, ctap2::StatusCode>)> + Send + 'static,
@@ -454,5 +466,9 @@ where
         losers.push(auth);
     }
 
-    (winner, errors, losers)
+    RaceOutcome {
+        winner,
+        errors,
+        losers,
+    }
 }
