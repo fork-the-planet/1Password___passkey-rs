@@ -205,13 +205,22 @@ where
         .await;
         self.devices = preserved;
         self.devices.extend(returned);
-        let ctap2_response = winner.ok_or_else(move || {
+        let (ctap2_response, winner_auth) = winner.ok_or_else(move || {
             errors
                 .into_iter()
                 .next_back()
                 .map(WebauthnError::from)
                 .unwrap_or(WebauthnError::NotSupportedError)
         })?;
+        // Report the transports the winning device advertises via `authenticatorGetInfo`, falling
+        // back to USB (which every `LinuxAuthenticator` uses) if the device doesn't publish a
+        // transports list.
+        let transports = winner_auth
+            .info()
+            .transports
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| vec![webauthn::AuthenticatorTransport::Usb]);
+        self.devices.push(winner_auth);
 
         let credential_id = ctap2_response
             .auth_data
@@ -242,8 +251,7 @@ where
                 public_key,
                 public_key_algorithm: alg,
                 attestation_object,
-                // Every `LinuxAuthenticator` uses the Usb transport.
-                transports: Some(vec![webauthn::AuthenticatorTransport::Usb]),
+                transports: Some(transports),
             },
             authenticator_attachment: Some(AuthenticatorAttachment::CrossPlatform),
             client_extension_results: Default::default(),
@@ -304,7 +312,7 @@ where
         .await;
         self.devices = preserved;
         self.devices.extend(returned);
-        let ctap2_response = winner.ok_or_else(move || {
+        let (ctap2_response, winner_auth) = winner.ok_or_else(move || {
             // Preserve the earlier behaviour: if every candidate reported
             // "no credentials", surface CredentialNotFound; otherwise surface
             // the most recent non-CredentialNotFound error.
@@ -322,6 +330,7 @@ where
                     .unwrap_or(WebauthnError::NotSupportedError)
             }
         })?;
+        self.devices.push(winner_auth);
 
         let credential_id_bytes = match ctap2_response.credential {
             Some(c) => c.id.to_vec(),
@@ -368,18 +377,21 @@ fn filter_algorithms(
         .collect()
 }
 
-/// Race a CTAP request across all candidates and cancel the losers once a
-/// winner has been found. `call` is invoked once per candidate with owned
-/// access to the authenticator and its request; the future it returns must
-/// hand the authenticator back so the [`LinuxClient`] can keep using it.
+/// Race a CTAP request across all candidates and cancel the losers once a winner has been found.
+/// `call` is invoked once per candidate with owned access to the authenticator and its request; the
+/// future it returns must hand the authenticator back so the [`LinuxClient`] can keep using it.
 ///
-/// Returns the winning response (if any), the [`ctap2::StatusCode`]s produced
-/// by the tasks that had already completed by the time a winner emerged, and
-/// every authenticator that entered the race.
+/// Returns the winning response paired with the authenticator that produced it (if any), the
+/// [`ctap2::StatusCode`]s produced by the tasks that had already completed by the time a winner
+/// emerged, and every other authenticator that entered the race.
 async fn race_request<Req, R, C, F>(
     candidates: Vec<(LinuxAuthenticator, Req)>,
     call: C,
-) -> (Option<R>, Vec<ctap2::StatusCode>, Vec<LinuxAuthenticator>)
+) -> (
+    Option<(R, LinuxAuthenticator)>,
+    Vec<ctap2::StatusCode>,
+    Vec<LinuxAuthenticator>,
+)
 where
     C: Fn(LinuxAuthenticator, Req) -> F,
     F: Future<Output = (LinuxAuthenticator, Result<R, ctap2::StatusCode>)> + Send + 'static,
@@ -404,24 +416,26 @@ where
         });
     }
 
-    let mut winner: Option<R> = None;
+    let mut winner: Option<(R, LinuxAuthenticator)> = None;
     let mut winner_idx: Option<usize> = None;
     let mut errors: Vec<ctap2::StatusCode> = Vec::new();
-    let mut returned: Vec<LinuxAuthenticator> = Vec::with_capacity(cancel_txs.len());
+    let mut losers: Vec<LinuxAuthenticator> = Vec::with_capacity(cancel_txs.len());
     let mut finished: Vec<usize> = Vec::with_capacity(cancel_txs.len());
 
     // Wait for task completions until we find a winner or exhaust all the tasks.
     while let Some(join_res) = set.join_next().await {
         let (idx, auth, result) = join_res.expect("race_request task panicked");
         finished.push(idx);
-        returned.push(auth);
         match result {
             Ok(resp) => {
-                winner = Some(resp);
+                winner = Some((resp, auth));
                 winner_idx = Some(idx);
                 break;
             }
-            Err(sc) => errors.push(sc),
+            Err(sc) => {
+                errors.push(sc);
+                losers.push(auth);
+            }
         }
     }
 
@@ -437,8 +451,8 @@ where
     // Wait on any remaining tasks so the transactions finish and we get the authenticators back.
     while let Some(join_res) = set.join_next().await {
         let (_idx, auth, _result) = join_res.expect("race_request task panicked");
-        returned.push(auth);
+        losers.push(auth);
     }
 
-    (winner, errors, returned)
+    (winner, errors, losers)
 }
