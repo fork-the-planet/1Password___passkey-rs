@@ -223,7 +223,9 @@ fn device_has_fido_usage(file: &File) -> io::Result<bool> {
     // by HID_MAX_DESCRIPTOR_SIZE, so the kernel will not write past the buffer.
     unsafe { ioctls::hidiocgrdesc(fd, &mut desc) }.map_err(io::Error::from)?;
 
-    Ok(report_descriptor_has_fido_usage(&desc.value[..size_usize.get()]))
+    Ok(report_descriptor_has_fido_usage(
+        &desc.value[..size_usize.get()],
+    ))
 }
 
 /// Walk an HID report descriptor and return whether it includes a `Usage Page (0xF1D0)` item.

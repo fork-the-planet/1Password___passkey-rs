@@ -196,8 +196,8 @@ impl LinuxAuthenticator {
         let response_raw =
             send_cbor_without_cancel(&device, init.channel, Ctap2Command::GetInfo, &[]).await?;
         // Validate that it parses.
-        let _: get_info::Response =
-            ciborium::de::from_reader(response_raw.get_payload()).map_err(|_| OpenError::InvalidGetInfo)?;
+        let _: get_info::Response = ciborium::de::from_reader(response_raw.get_payload())
+            .map_err(|_| OpenError::InvalidGetInfo)?;
 
         let (tx, rx) = mpsc::channel(1);
         Ok(LinuxAuthenticator {
@@ -279,15 +279,13 @@ struct CtaphidCborResponse {
 impl CtaphidCborResponse {
     fn new(raw: Vec<u8>) -> Result<Self, CtaphidCborResponseError> {
         // Verify that status byte exists and is equal to the success code (0)
-        let Some(status) = raw.get(0) else {
+        let Some(status) = raw.first() else {
             return Err(CtaphidCborResponseError::ResponseEmpty);
         };
         if *status != u8::from(U2FError::Success) {
             return Err(CtaphidCborResponseError::BadStatus(*status));
         };
-        Ok(Self {
-            raw
-        })
+        Ok(Self { raw })
     }
 
     fn get_payload(&self) -> &[u8] {
@@ -315,7 +313,10 @@ async fn send_cbor(
 }
 
 /// Await a CTAPHID_CBOR response and return its CBOR body.
-async fn recv_cbor(device: &HidDevice, channel: u32) -> Result<CtaphidCborResponse, TransactionError> {
+async fn recv_cbor(
+    device: &HidDevice,
+    channel: u32,
+) -> Result<CtaphidCborResponse, TransactionError> {
     let response = device.recv(channel).await.map_err(TransactionError::Hid)?;
     if !matches!(response.command, Command::Cbor) {
         return Err(TransactionError::Hid(HidrawError::Protocol(
@@ -325,14 +326,14 @@ async fn recv_cbor(device: &HidDevice, channel: u32) -> Result<CtaphidCborRespon
     let bytes = response.payload;
     let response = match CtaphidCborResponse::new(bytes) {
         Ok(r) => r,
-        Err(CtaphidCborResponseError::ResponseEmpty) => return Err(
-            TransactionError::Hid(HidrawError::Protocol(
+        Err(CtaphidCborResponseError::ResponseEmpty) => {
+            return Err(TransactionError::Hid(HidrawError::Protocol(
                 "empty CTAPHID_CBOR response",
-            ))
-        ),
-        Err(CtaphidCborResponseError::BadStatus(status)) => return Err(
-            TransactionError::Status(StatusCode::from(status))
-        ),
+            )));
+        }
+        Err(CtaphidCborResponseError::BadStatus(status)) => {
+            return Err(TransactionError::Status(StatusCode::from(status)));
+        }
     };
     Ok(response)
 }
