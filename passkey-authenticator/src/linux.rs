@@ -101,7 +101,7 @@ pub struct LinuxAuthenticatorInner {
     /// without interior mutability. Caching the bytes lets us hand out fresh
     /// `Response` values cheaply, and avoids requiring `Clone` on the response
     /// type, which lives in `passkey-types`.
-    get_info_cbor: Vec<u8>,
+    get_info_cbor: CtaphidCborResponse,
     cancel_rx: mpsc::Receiver<()>,
 }
 
@@ -118,7 +118,7 @@ impl LinuxAuthenticatorInner {
             .send_cbor_with_cancel(Ctap2Command::MakeCredential, &body)
             .await
             .map_err(StatusCode::from)?;
-        ciborium::de::from_reader(response.as_slice())
+        ciborium::de::from_reader(response.get_payload())
             .map_err(|_| StatusCode::from(Ctap2Error::InvalidCbor))
     }
 
@@ -134,7 +134,7 @@ impl LinuxAuthenticatorInner {
             .send_cbor_with_cancel(Ctap2Command::GetAssertion, &body)
             .await
             .map_err(StatusCode::from)?;
-        ciborium::de::from_reader(response.as_slice())
+        ciborium::de::from_reader(response.get_payload())
             .map_err(|_| StatusCode::from(Ctap2Error::InvalidCbor))
     }
 
@@ -147,7 +147,7 @@ impl LinuxAuthenticatorInner {
         &mut self,
         command: Ctap2Command,
         body: &[u8],
-    ) -> Result<Vec<u8>, TransactionError> {
+    ) -> Result<CtaphidCborResponse, TransactionError> {
         // Drop any cancel signals that arrived before this call started so
         // they don't immediately abort the request we're about to send.
         while self.cancel_rx.try_recv().is_ok() {}
@@ -193,11 +193,11 @@ impl LinuxAuthenticator {
 
         // Fetch authenticatorGetInfo so we can cache it and surface any obvious
         // device-side errors before returning to the caller.
-        let raw =
+        let response_raw =
             send_cbor_without_cancel(&device, init.channel, Ctap2Command::GetInfo, &[]).await?;
         // Validate that it parses.
         let _: get_info::Response =
-            ciborium::de::from_reader(raw.as_slice()).map_err(|_| OpenError::InvalidGetInfo)?;
+            ciborium::de::from_reader(response_raw.get_payload()).map_err(|_| OpenError::InvalidGetInfo)?;
 
         let (tx, rx) = mpsc::channel(1);
         Ok(LinuxAuthenticator {
@@ -205,7 +205,7 @@ impl LinuxAuthenticator {
                 device,
                 channel: init.channel,
                 capabilities: init.capabilities,
-                get_info_cbor: raw,
+                get_info_cbor: response_raw,
                 cancel_rx: rx,
             },
             cancel_tx: tx,
@@ -219,7 +219,7 @@ impl LinuxAuthenticator {
 
     /// Read and decode the cached `authenticatorGetInfo` response.
     pub fn info(&self) -> get_info::Response {
-        ciborium::de::from_reader(self.inner.get_info_cbor.as_slice()).unwrap_or_default()
+        ciborium::de::from_reader(self.inner.get_info_cbor.get_payload()).unwrap_or_default()
     }
 
     /// Issue `authenticatorMakeCredential` against the device.
@@ -267,6 +267,36 @@ impl From<TransactionError> for StatusCode {
     }
 }
 
+enum CtaphidCborResponseError {
+    ResponseEmpty,
+    BadStatus(u8),
+}
+
+struct CtaphidCborResponse {
+    raw: Vec<u8>,
+}
+
+impl CtaphidCborResponse {
+    fn new(raw: Vec<u8>) -> Result<Self, CtaphidCborResponseError> {
+        // Verify that status byte exists and is equal to the success code (0)
+        let Some(status) = raw.get(0) else {
+            return Err(CtaphidCborResponseError::ResponseEmpty);
+        };
+        if *status != u8::from(U2FError::Success) {
+            return Err(CtaphidCborResponseError::BadStatus(*status));
+        };
+        Ok(Self {
+            raw
+        })
+    }
+
+    fn get_payload(&self) -> &[u8] {
+        // SAFETY: this slice is never out of bounds because we verify in the constructor that `raw`
+        // has at least one byte.
+        &self.raw[1..]
+    }
+}
+
 /// Send a CTAPHID_CBOR request.
 async fn send_cbor(
     device: &HidDevice,
@@ -285,24 +315,26 @@ async fn send_cbor(
 }
 
 /// Await a CTAPHID_CBOR response and return its CBOR body.
-async fn recv_cbor(device: &HidDevice, channel: u32) -> Result<Vec<u8>, TransactionError> {
+async fn recv_cbor(device: &HidDevice, channel: u32) -> Result<CtaphidCborResponse, TransactionError> {
     let response = device.recv(channel).await.map_err(TransactionError::Hid)?;
     if !matches!(response.command, Command::Cbor) {
         return Err(TransactionError::Hid(HidrawError::Protocol(
             "unexpected CTAPHID command in response",
         )));
     }
-    let mut bytes = response.payload;
-    if bytes.is_empty() {
-        return Err(TransactionError::Hid(HidrawError::Protocol(
-            "empty CTAPHID_CBOR response",
-        )));
-    }
-    let status = bytes.remove(0);
-    if status != u8::from(U2FError::Success) {
-        return Err(TransactionError::Status(StatusCode::from(status)));
-    }
-    Ok(bytes)
+    let bytes = response.payload;
+    let response = match CtaphidCborResponse::new(bytes) {
+        Ok(r) => r,
+        Err(CtaphidCborResponseError::ResponseEmpty) => return Err(
+            TransactionError::Hid(HidrawError::Protocol(
+                "empty CTAPHID_CBOR response",
+            ))
+        ),
+        Err(CtaphidCborResponseError::BadStatus(status)) => return Err(
+            TransactionError::Status(StatusCode::from(status))
+        ),
+    };
+    Ok(response)
 }
 
 /// Run one CTAPHID_CBOR transaction and return the CBOR body of the response.
@@ -314,7 +346,7 @@ async fn send_cbor_without_cancel(
     channel: u32,
     command: Ctap2Command,
     body: &[u8],
-) -> Result<Vec<u8>, TransactionError> {
+) -> Result<CtaphidCborResponse, TransactionError> {
     send_cbor(device, channel, command, body).await?;
     recv_cbor(device, channel).await
 }
