@@ -10,6 +10,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::num::{NonZeroI32, NonZeroU32, NonZeroUsize};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -193,21 +194,28 @@ fn device_has_fido_usage(file: &File) -> io::Result<bool> {
     // SAFETY: `HIDIOCGRDESCSIZE` writes a single `int` through the supplied pointer.
     // `size` is a `c_int` that outlives the call.
     unsafe { ioctls::hidiocgrdescsize(fd, &mut size) }.map_err(io::Error::from)?;
-    if size <= 0 {
-        return Ok(false);
-    }
-    let Ok(size) = u32::try_from(size) else {
-        return Ok(false);
-    };
-    let Ok(size_usize) = usize::try_from(size) else {
+
+    // Ensure that `size` is nonzero.
+    let Some(size) = NonZeroI32::new(size) else {
         return Ok(false);
     };
-    if size_usize > HID_MAX_DESCRIPTOR_SIZE {
+
+    // Ensure that `size` is nonzero.
+    let Ok(size) = NonZeroU32::try_from(size) else {
+        return Ok(false);
+    };
+
+    // Ensure that `size` is nonnegative.
+    let Ok(size_usize) = NonZeroUsize::try_from(size) else {
+        return Ok(false);
+    };
+
+    if size_usize.get() > HID_MAX_DESCRIPTOR_SIZE {
         return Ok(false);
     }
 
     let mut desc = ioctls::HidrawReportDescriptor {
-        size,
+        size: size.get(),
         value: [0u8; HID_MAX_DESCRIPTOR_SIZE],
     };
     // SAFETY: `HIDIOCGRDESC` reads `desc.size` bytes into `desc.value`. We initialised
@@ -215,7 +223,7 @@ fn device_has_fido_usage(file: &File) -> io::Result<bool> {
     // by HID_MAX_DESCRIPTOR_SIZE, so the kernel will not write past the buffer.
     unsafe { ioctls::hidiocgrdesc(fd, &mut desc) }.map_err(io::Error::from)?;
 
-    Ok(report_descriptor_has_fido_usage(&desc.value[..size_usize]))
+    Ok(report_descriptor_has_fido_usage(&desc.value[..size_usize.get()]))
 }
 
 /// Walk an HID report descriptor and return whether it includes a `Usage Page (0xF1D0)` item.
