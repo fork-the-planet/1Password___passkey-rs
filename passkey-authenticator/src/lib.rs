@@ -30,6 +30,9 @@ mod passkey;
 mod u2f;
 mod user_validation;
 
+#[cfg(all(feature = "linux", target_os = "linux"))]
+pub mod linux;
+
 use coset::{
     CoseKey, CoseKeyBuilder,
     iana::{self, Algorithm, EnumI64},

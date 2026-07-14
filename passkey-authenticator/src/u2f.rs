@@ -96,7 +96,7 @@ impl<S: CredentialStore + Sync + Send, U: UserValidationMethod + Sync + Send> U2
             Passkey::wrap_u2f_registration_request(&request, &response, handle, &private);
 
         // U2F registration does not use rk, uv, or up
-        let options = passkey_types::ctap2::get_assertion::Options {
+        let options = passkey_types::ctap2::make_credential::Options {
             rk: false,
             uv: false,
             up: false,
