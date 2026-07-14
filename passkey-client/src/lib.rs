@@ -90,6 +90,8 @@ pub enum WebauthnError {
     TimeoutError,
 }
 
+const MAX_CREDENTIAL_ID_LENGTH: usize = 1023;
+
 // Library sets tokio import as optional, timeouts rely on it
 // Not sure if tokio should still be optional but guarding for now to avoid breaking changes
 // https://www.w3.org/TR/webauthn-3/#recommended-range-and-default-for-a-webauthn-ceremony-timeout
@@ -418,6 +420,13 @@ where
             .attested_credential_data
             .as_ref()
             .unwrap();
+
+        // Validate returned credential ID length to comply with new credential registration ceremony spec
+        // https://w3c.github.io/webauthn/#sctn-registering-a-new-credential
+        if credential_id.credential_id().len() > MAX_CREDENTIAL_ID_LENGTH {
+            return Err(WebauthnError::CredentialIdTooLong);
+        }
+
         let alg = match credential_id.key.alg.as_ref().unwrap() {
             Algorithm::PrivateUse(val) => *val,
             Algorithm::Assigned(alg) => alg.to_i64(),
